@@ -1,0 +1,35 @@
+# Datos descargados/procesados y artefactos de ejecución: nunca al repositorio
+/data/
+/tmp/
+*.log
+
+# Entornos y secretos locales
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+/build/
+/dist/
+
+# Herramientas de desarrollo y pruebas
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyright/
+.coverage
+.coverage.*
+/htmlcov/
+.marimo/
+.ipynb_checkpoints/
+
+# Editor y sistema operativo
+.DS_Store
+.idea/
+.vscode/

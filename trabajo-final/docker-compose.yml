@@ -1,0 +1,203 @@
+name: fpuna-tp-hidromet
+
+x-lab-environment: &lab-environment
+  KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  KAFKA_RAW_TOPIC: ema.lecturas.v1
+  KAFKA_AGGREGATES_TOPIC: ema.agregados.v1
+  KAFKA_DLQ_TOPIC: ema.lecturas.dlq.v1
+  BEAM_JOB_ENDPOINT: beam-job-server:8099
+  BEAM_PARALLELISM: "${BEAM_PARALLELISM:-2}"
+  WINDOW_SECONDS: "600"
+  HOURLY_WINDOW_SECONDS: "3600"
+  ALLOWED_LATENESS_SECONDS: "1200"
+  EARLY_FIRING_SECONDS: "10"
+  ALERT_PRECIP_10MIN_MM: "10"
+  ALERT_GUST_MS: "20"
+  HIDROMET_DATASET_SOURCE: "${HIDROMET_DATASET_SOURCE:-openmeteo}"
+  HIDROMET_LAB_ROOT: /app
+
+x-notebook: &notebook
+  build:
+    context: .
+    dockerfile: Dockerfile
+  environment: *lab-environment
+  volumes:
+    - ./src:/app/src
+    - ./data:/app/data
+    - ./tmp:/app/tmp
+  restart: unless-stopped
+
+services:
+  kafka:
+    image: apache/kafka:4.1.1
+    ports:
+      - "29092:29092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: CONTROLLER://:9093,PLAINTEXT://:9092,PLAINTEXT_HOST://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_NUM_PARTITIONS: 4
+      KAFKA_LOG_RETENTION_HOURS: 24
+      # El replay acelera el reloj de pared, pero conserva el tiempo de evento:
+      # a 60x, una semana de lecturas queda ~7 días por delante del reloj del
+      # broker. Se admite hasta 30 días de adelanto.
+      KAFKA_LOG_MESSAGE_TIMESTAMP_AFTER_MAX_MS: 2592000000
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    mem_limit: 1200m
+
+  kafka-init:
+    image: apache/kafka:4.1.1
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-ec"]
+    command:
+      - |
+        for topic in ema.lecturas.v1 ema.lecturas.dlq.v1; do
+          /opt/kafka/bin/kafka-topics.sh \
+            --bootstrap-server kafka:9092 \
+            --create --if-not-exists \
+            --topic "$$topic" --partitions 4 --replication-factor 1
+        done
+        # Los agregados se compactan: por cada aggregate_id queda el último pane.
+        /opt/kafka/bin/kafka-topics.sh \
+          --bootstrap-server kafka:9092 \
+          --create --if-not-exists \
+          --topic ema.agregados.v1 --partitions 4 --replication-factor 1 \
+          --config cleanup.policy=compact
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --describe
+
+  dataset-init:
+    <<: *notebook
+    # Descarga datos reales (Open-Meteo/ERA5) para el período por defecto; si
+    # no hay red, genera el dataset sintético equivalente.
+    command:
+      - /app/.venv/bin/python
+      - -m
+      - hidromet_streaming.dataset
+      - --source
+      - ${HIDROMET_DATASET_SOURCE:-openmeteo}
+      - --fallback-sintetico
+      - --skip-if-exists   # conserva un dataset preparado a mano (p. ej. --source marr)
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    restart: "no"
+
+  jobmanager:
+    platform: ${BEAM_PLATFORM:-linux/amd64}
+    build:
+      context: .
+      dockerfile: docker/flink/Dockerfile
+    command: jobmanager
+    ports:
+      - "8081:8081"
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: jobmanager
+        jobmanager.memory.process.size: 768m
+        parallelism.default: ${BEAM_PARALLELISM:-2}
+    volumes:
+      - beam-artifacts:/tmp/beam-artifact-staging
+    mem_limit: 900m
+
+  taskmanager:
+    platform: ${BEAM_PLATFORM:-linux/amd64}
+    build:
+      context: .
+      dockerfile: docker/flink/Dockerfile
+    command: taskmanager
+    depends_on:
+      - jobmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: 1
+        taskmanager.memory.process.size: 1536m
+        taskmanager.memory.task.off-heap.size: 384m
+        taskmanager.memory.managed.fraction: 0.1
+        taskmanager.memory.network.min: 64m
+        taskmanager.memory.network.max: 64m
+        parallelism.default: ${BEAM_PARALLELISM:-2}
+        taskmanager.load-balance.mode: SLOTS
+    volumes:
+      - beam-artifacts:/tmp/beam-artifact-staging
+    deploy:
+      replicas: 2
+    mem_limit: 2800m
+
+  beam-job-server:
+    platform: ${BEAM_PLATFORM:-linux/amd64}
+    image: apache/beam_flink1.19_job_server:2.74.0
+    command:
+      - --flink-master=jobmanager:8081
+      - --job-host=beam-job-server
+      - --flink-conf-dir=/flink-conf
+    volumes:
+      - ./docker/flink:/flink-conf:ro
+      - beam-artifacts:/tmp/beam-artifact-staging
+    ports:
+      - "8099:8099"
+    depends_on:
+      - jobmanager
+      - taskmanager
+    mem_limit: 900m
+
+  producer-notebook:
+    <<: *notebook
+    command: ["/app/.venv/bin/marimo", "run", "producer_notebook.py", "--host", "0.0.0.0", "--port", "2718"]
+    ports:
+      - "2718:2718"
+    depends_on:
+      dataset-init:
+        condition: service_completed_successfully
+
+  pipeline-notebook:
+    <<: *notebook
+    command: ["/app/.venv/bin/marimo", "run", "pipeline_notebook.py", "--host", "0.0.0.0", "--port", "2718"]
+    ports:
+      - "2719:2718"
+    depends_on:
+      dataset-init:
+        condition: service_completed_successfully
+      beam-job-server:
+        condition: service_started
+
+  analytics-notebook:
+    <<: *notebook
+    command: ["/app/.venv/bin/marimo", "run", "analytics_notebook.py", "--host", "0.0.0.0", "--port", "2718"]
+    ports:
+      - "2720:2718"
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+
+  smoke:
+    <<: *notebook
+    profiles: ["smoke"]
+    command: ["/app/.venv/bin/python", "scripts/smoke.py"]
+    depends_on:
+      dataset-init:
+        condition: service_completed_successfully
+      beam-job-server:
+        condition: service_started
+    restart: "no"
+
+volumes:
+  kafka-data:
+  beam-artifacts:

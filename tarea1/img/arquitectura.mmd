@@ -1,0 +1,45 @@
+%%{init: {"theme": "neutral", "flowchart": {"curve": "basis", "nodeSpacing": 30, "rankSpacing": 45}}}%%
+flowchart LR
+    subgraph FUENTES["Fuentes (productores)"]
+        EMA["Estaciones meteorológicas<br/>automáticas (EMAS)<br/>~40 estaciones · cada 10 min"]
+        GW["Gateway de telemetría<br/>(productor Kafka)"]
+        IMERG["NASA GPM IMERG<br/>grilla 0,1° · cada 30 min<br/>corridas Early / Late / Final"]
+        POLL["Poller IMERG<br/>(productor Kafka)"]
+        EMA --> GW
+        IMERG --> POLL
+    end
+
+    subgraph KAFKA["Apache Kafka"]
+        direction TB
+        T1[("ema.lecturas.raw<br/>key = station_id · 12 part.<br/>retención 30 d")]
+        T2[("satelite.imerg.raw<br/>key = cell_id · 12 part.<br/>retención 120 d")]
+        DLQ[("ema.lecturas.dlq<br/>retención 14 d")]
+        T3[("agg.precip.1h<br/>key = station_id|window_start<br/>compactado")]
+        T4[("alertas.hidromet<br/>key = zona<br/>retención 7 d")]
+    end
+
+    GW -->|JSON| T1
+    GW -.->|inválidos| DLQ
+    POLL -->|JSON| T2
+
+    subgraph PROC["Procesamiento (Apache Beam)"]
+        BEAM["Pipeline Beam<br/>event time · ventanas 10 min / 1 h<br/>watermark + lateness · dedup con estado"]
+    end
+
+    T1 --> BEAM
+    T2 --> BEAM
+    BEAM --> T3
+    BEAM --> T4
+
+    subgraph CONS["Consumidores"]
+        DB[("TimescaleDB / Postgres<br/>UPSERT por station_id|window_start")]
+        DASH["Dashboard<br/>operativo"]
+        ML["Detección de anomalías<br/>(opcional, clase 8)"]
+        LAKE[("Archivo Parquet<br/>data lake")]
+    end
+
+    T3 -->|"grupo: sink-db"| DB
+    T4 -->|"grupo: alertas"| DASH
+    T3 -->|"grupo: ml-scoring"| ML
+    T1 -->|"grupo: archivador"| LAKE
+    DB --> DASH

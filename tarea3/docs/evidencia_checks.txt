@@ -1,0 +1,4 @@
+$ uv run ruff check notebook.py tests
+All checks passed!
+$ uv run marimo check --strict notebook.py
+(sin observaciones)

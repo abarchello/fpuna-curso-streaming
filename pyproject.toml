@@ -1,0 +1,34 @@
+# Workspace de uv para todo el curso.
+#
+# Un solo ambiente virtual (.venv en esta carpeta) y un solo uv.lock para
+# todas las entregas. Instalar o actualizar todo:
+#
+#     uv sync --all-packages
+#
+# Ver GUIA_UV.md para el uso diario.
+
+[project]
+name = "fpuna-curso-streaming"
+version = "0.1.0"
+description = "Entregas de Streaming de datos y sus aplicaciones (MIAAD, FP-UNA)"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  # Tareas 1 y 2 (no son paquetes): gráfico de la Tarea 2, metadatos de los
+  # PDF y la demo opcional de Kafka de la Tarea 1.
+  "matplotlib>=3.9,<4",
+  "pypdf>=5,<7",
+  "kafka-python>=2.2,<3",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3,<9",
+  "ruff>=0.11,<1",
+]
+
+[tool.uv]
+package = false  # la raíz no es un paquete instalable, sólo agrupa
+
+[tool.uv.workspace]
+members = ["tarea3", "trabajo-final"]

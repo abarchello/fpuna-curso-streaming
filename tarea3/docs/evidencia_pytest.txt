@@ -1,0 +1,28 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.11, pytest-8.4.2, pluggy-1.6.0 -- <repo>/.venv/bin/python
+rootdir: <repo>
+configfile: pyproject.toml
+plugins: anyio-4.14.2
+collecting ... collected 19 items
+
+tests/test_assignment.py::test_parse_utc_returns_timezone_aware_datetime PASSED [  5%]
+tests/test_assignment.py::test_assign_fixed_window_uses_event_time PASSED [ 10%]
+tests/test_assignment.py::test_duplicate_does_not_change_total PASSED    [ 15%]
+tests/test_assignment.py::test_deduplication_is_isolated_by_merchant PASSED [ 21%]
+tests/test_assignment.py::test_stateful_dofn_keeps_keys_isolated PASSED  [ 26%]
+tests/test_assignment.py::test_out_of_order_event_uses_its_event_time_window PASSED [ 31%]
+tests/test_assignment.py::test_late_event_within_tolerance_is_a_revision PASSED [ 36%]
+tests/test_assignment.py::test_event_beyond_lateness_is_audited PASSED   [ 42%]
+tests/test_assignment.py::test_windowed_pipeline_produces_totals PASSED  [ 47%]
+tests/test_assignment.py::test_trigger_policy_has_lateness_and_accumulating_panes PASSED [ 52%]
+tests/test_assignment.py::test_retries_converge_to_one_materialized_entity PASSED [ 57%]
+tests/test_assignment.py::test_append_only_sink_materializes_every_attempt PASSED [ 63%]
+tests/test_assignment.py::test_timer_handler_clears_state PASSED         [ 68%]
+tests/test_streaming_panes.py::test_late_event_within_lateness_produces_late_pane PASSED [ 73%]
+tests/test_streaming_panes.py::test_event_beyond_lateness_is_dropped PASSED [ 78%]
+tests/test_streaming_panes.py::test_stateful_dedup_in_streaming_ignores_duplicate PASSED [ 84%]
+tests/test_streaming_panes.py::test_out_of_order_event_in_streaming_lands_in_its_event_time_window PASSED [ 89%]
+tests/test_streaming_panes.py::test_stateful_dedup_in_streaming_keeps_merchants_isolated PASSED [ 94%]
+tests/test_streaming_panes.py::test_expiry_timer_clears_dedup_state_in_streaming PASSED [100%]
+
+============================== 19 passed in 4.04s ==============================

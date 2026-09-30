@@ -1,0 +1,11 @@
+.venv/
+.marimo/
+__marimo__/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+output/
+dist/
+build/
+.DS_Store

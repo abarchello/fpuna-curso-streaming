@@ -1,0 +1,64 @@
+Evidencia de ejecución de la demo de la Tarea 1 con las herramientas de consola de Kafka
+(imagen oficial apache/kafka:4.1.1 en modo KRaft, como en el quickstart de la clase 2).
+Se levantó con `docker compose up -d` desde tarea1/demo. Los comandos se corren dentro del
+contenedor `kafka`; acá se muestran sin el prefijo `docker compose exec kafka /opt/kafka/bin/`.
+
+$ kafka-topics.sh --version
+4.1.1
+
+$ kafka-topics.sh --bootstrap-server kafka:29092 --list
+agg.precip.1h
+alertas.hidromet
+ema.lecturas.dlq
+ema.lecturas.raw
+satelite.imerg.raw
+
+$ kafka-topics.sh --bootstrap-server kafka:29092 --describe --topic ema.lecturas.raw
+Topic: ema.lecturas.raw	TopicId: 4yoznPYUTXSIrb6nCFpD-A	PartitionCount: 12	ReplicationFactor: 1	Configs: min.insync.replicas=1,cleanup.policy=delete,retention.ms=2592000000
+	Topic: ema.lecturas.raw	Partition: 0	Leader: 1	Replicas: 1	Isr: 1	Elr: 	LastKnownElr: 
+	Topic: ema.lecturas.raw	Partition: 1	Leader: 1	Replicas: 1	Isr: 1	Elr: 	LastKnownElr: 
+	Topic: ema.lecturas.raw	Partition: 2	Leader: 1	Replicas: 1	Isr: 1	Elr: 	LastKnownElr: 
+
+$ kafka-configs.sh --bootstrap-server kafka:29092 --describe --entity-type topics --entity-name ema.lecturas.raw
+Dynamic configs for topic ema.lecturas.raw are:
+  cleanup.policy=delete sensitive=false synonyms={DYNAMIC_TOPIC_CONFIG:cleanup.policy=delete, DEFAULT_CONFIG:log.cleanup.policy=delete}
+  retention.ms=2592000000 sensitive=false synonyms={DYNAMIC_TOPIC_CONFIG:retention.ms=2592000000}
+
+$ kafka-console-producer.sh --bootstrap-server kafka:29092 --topic ema.lecturas.raw --property parse.key=true --property key.separator="|"
+> ITA07|{"event_id":"ema-ITA07-20260924T140000Z","station_id":"ITA07","event_time":"2026-09-24T14:00:00Z","arrival_time":"2026-09-24T14:00:06Z","precip_mm":1.2}
+> ITA12|{"event_id":"ema-ITA12-20260924T141000Z","station_id":"ITA12","event_time":"2026-09-24T14:10:00Z","arrival_time":"2026-09-24T14:10:05Z","precip_mm":0.4}
+> ITA07|{"event_id":"ema-ITA07-20260924T141000Z","station_id":"ITA07","event_time":"2026-09-24T14:10:00Z","arrival_time":"2026-09-24T14:10:07Z","precip_mm":3.2}
+> ITA07|{"event_id":"ema-ITA07-20260924T141000Z","station_id":"ITA07","event_time":"2026-09-24T14:10:00Z","arrival_time":"2026-09-24T14:10:37Z","precip_mm":3.2}
+> ITA23|{"event_id":"ema-ITA23-20260924T134000Z","station_id":"ITA23","event_time":"2026-09-24T13:40:00Z","arrival_time":"2026-09-24T14:10:41Z","precip_mm":6.8}
+
+$ kafka-console-consumer.sh --bootstrap-server kafka:29092 --topic ema.lecturas.raw --group demo-consola --from-beginning --max-messages 5 --property print.partition=true --property print.offset=true --property print.key=true
+Partition:7	Offset:0	ITA07	{"event_id":"ema-ITA07-20260924T140000Z","station_id":"ITA07","event_time":"2026-09-24T14:00:00Z","arrival_time":"2026-09-24T14:00:06Z","precip_mm":1.2}
+Partition:7	Offset:1	ITA07	{"event_id":"ema-ITA07-20260924T141000Z","station_id":"ITA07","event_time":"2026-09-24T14:10:00Z","arrival_time":"2026-09-24T14:10:07Z","precip_mm":3.2}
+Partition:7	Offset:2	ITA07	{"event_id":"ema-ITA07-20260924T141000Z","station_id":"ITA07","event_time":"2026-09-24T14:10:00Z","arrival_time":"2026-09-24T14:10:37Z","precip_mm":3.2}
+Partition:4	Offset:0	ITA12	{"event_id":"ema-ITA12-20260924T141000Z","station_id":"ITA12","event_time":"2026-09-24T14:10:00Z","arrival_time":"2026-09-24T14:10:05Z","precip_mm":0.4}
+Partition:11	Offset:0	ITA23	{"event_id":"ema-ITA23-20260924T134000Z","station_id":"ITA23","event_time":"2026-09-24T13:40:00Z","arrival_time":"2026-09-24T14:10:41Z","precip_mm":6.8}
+Processed a total of 5 messages
+
+$ kafka-consumer-groups.sh --bootstrap-server kafka:29092 --describe --group demo-consola
+
+Consumer group 'demo-consola' has no active members.
+
+GROUP           TOPIC            PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG             CONSUMER-ID     HOST            CLIENT-ID
+demo-consola    ema.lecturas.raw 7          3               3               0               -               -               -
+demo-consola    ema.lecturas.raw 4          1               1               0               -               -               -
+demo-consola    ema.lecturas.raw 11         1               1               0               -               -               -
+
+$ kafka-consumer-groups.sh --bootstrap-server kafka:29092 --group demo-consola --topic ema.lecturas.raw --reset-offsets --to-earliest --execute
+GROUP                          TOPIC                          PARTITION  NEW-OFFSET
+demo-consola                   ema.lecturas.raw               7          0              
+demo-consola                   ema.lecturas.raw               4          0              
+demo-consola                   ema.lecturas.raw               11         0
+(las otras 9 particiones no tienen mensajes y también quedan en 0)
+
+$ kafka-console-consumer.sh ... (mismo grupo, después del reset: replay)
+Partition:7	Offset:0	ITA07	{"event_id":"ema-ITA07-20260924T140000Z","station_id":"ITA07","event_time":"2026-09-24T14:00:00Z","arrival_time":"2026-09-24T14:00:06Z","precip_mm":1.2}
+Partition:7	Offset:1	ITA07	{"event_id":"ema-ITA07-20260924T141000Z","station_id":"ITA07","event_time":"2026-09-24T14:10:00Z","arrival_time":"2026-09-24T14:10:07Z","precip_mm":3.2}
+Partition:7	Offset:2	ITA07	{"event_id":"ema-ITA07-20260924T141000Z","station_id":"ITA07","event_time":"2026-09-24T14:10:00Z","arrival_time":"2026-09-24T14:10:37Z","precip_mm":3.2}
+Partition:4	Offset:0	ITA12	{"event_id":"ema-ITA12-20260924T141000Z","station_id":"ITA12","event_time":"2026-09-24T14:10:00Z","arrival_time":"2026-09-24T14:10:05Z","precip_mm":0.4}
+Partition:11	Offset:0	ITA23	{"event_id":"ema-ITA23-20260924T134000Z","station_id":"ITA23","event_time":"2026-09-24T13:40:00Z","arrival_time":"2026-09-24T14:10:41Z","precip_mm":6.8}
+Processed a total of 5 messages

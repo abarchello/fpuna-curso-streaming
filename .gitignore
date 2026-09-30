@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.marimo/
+__marimo__/
+.idea/
+.vscode/
+.DS_Store
+tmp/
+*.log
+# datos del trabajo final: nunca se versionan (el repo usa datos abiertos que se descargan)
+trabajo-final/data/cache/
+trabajo-final/data/raw/
+trabajo-final/data/processed/
+!trabajo-final/data/**/.gitkeep

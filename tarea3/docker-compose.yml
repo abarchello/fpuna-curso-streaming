@@ -1,0 +1,33 @@
+services:
+  notebook:
+    build: .
+    command:
+      - /app/.venv/bin/marimo
+      - edit
+      - notebook.py
+      - --headless
+      - --no-token
+      - --host
+      - 0.0.0.0
+      - --port
+      - "2718"
+    ports:
+      - "2718:2718"
+    volumes:
+      - ./notebook.py:/app/notebook.py
+      - ./data:/app/data
+
+  viewer:
+    build: .
+    command:
+      - /app/.venv/bin/marimo
+      - run
+      - notebook.py
+      - --host
+      - 0.0.0.0
+      - --port
+      - "2718"
+    ports:
+      - "2719:2718"
+    profiles:
+      - view

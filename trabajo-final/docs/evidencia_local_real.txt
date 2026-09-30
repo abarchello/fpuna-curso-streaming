@@ -1,0 +1,34 @@
+Corrida de referencia local (DirectRunner en modo batch, sin Kafka ni Flink) con datos reales.
+Comando: uv run python scripts/run_local.py --max-readings 200000
+Dataset: --source csv, 2024-07-01 a 2026-06-30, 792 653 lecturas de 12 estaciones (no se publica)
+Tramo: las primeras 200 000 lecturas, de 2024-07-01T00:00Z a 2025-01-07T01:40Z, 9 estaciones
+Fecha: 2026-09-30  ·  código de salida: 0  ·  duración: 3 min 53 s
+
+{
+  "readings": 200000,
+  "published": {
+    "events": 203960,
+    "duplicates": 3960,
+    "delayed": 141145
+  },
+  "dlq_records": 2,
+  "aggregates": 224341,
+  "by_metric_type": {
+    "estacion_10min": 200000,
+    "subcuenca_1h": 24314,
+    "alerta": 27
+  }
+}
+
+Comprobación con un cálculo aparte en pandas sobre las mismas 200 000 lecturas (sin Beam):
+
+  agregados de estación               200 000   claves únicas: 200 000   con más de una lectura: 0
+  lluvia total, pipeline (mm)         5 173,2
+  lluvia total, pandas (mm)           5 173,2   igual estación por estación
+  agregados de subcuenca por hora      24 314
+  pares (subcuenca, hora) en pandas    24 314
+  alertas de lluvia intensa                27
+  lecturas con 10 mm o más en pandas       27
+
+Los 2 registros de la DLQ son los inválidos que agrega el script: un JSON al que le faltan
+campos y una lectura con temp_c = 99.

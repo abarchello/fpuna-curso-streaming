@@ -1,0 +1,28 @@
+{
+  "event_id": "ema-ITA07-20260924T141000Z",
+  "event_type": "ema.lectura",
+  "schema_version": 1,
+  "station_id": "ITA07",
+  "station_name": "EMA Margen Derecha - Hernandarias",
+  "cuenca": "parana-alto",
+  "lat": -25.41,
+  "lon": -54.59,
+  "event_time": "2026-09-24T14:10:00Z",
+  "arrival_time": "2026-09-24T14:10:07Z",
+  "seq": 1842,
+  "variables": {
+    "precip_mm": 3.2,
+    "temp_c": 27.4,
+    "hr_pct": 81,
+    "presion_hpa": 1004.6,
+    "viento_ms": 4.8,
+    "viento_dir_deg": 135,
+    "rafaga_ms": 9.1,
+    "radiacion_wm2": 512
+  },
+  "calidad": {
+    "bateria_v": 12.7,
+    "flag_qc": "OK"
+  },
+  "producer": "gateway-telemetria-v1"
+}

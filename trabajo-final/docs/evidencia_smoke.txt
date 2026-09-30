@@ -1,0 +1,37 @@
+Prueba de humo end-to-end (Kafka -> Beam sobre Flink -> Kafka) con Docker Compose, perfil smoke.
+Comando: docker compose --profile smoke up --build --abort-on-container-exit --exit-code-from smoke smoke
+Fecha: 2026-09-29T23:04Z  ·  código de salida: 0
+
+%4|1790698328.866|GETPID|ema-replay-producer#producer-2| [thrd:main]: Failed to acquire idempotence PID from broker kafka:9092/1: Broker: Coordinator load in progress: retrying
+{"state": "DONE"}
+{
+  "produced": {
+    "events": 127,
+    "duplicates": 7,
+    "delayed": 83
+  },
+  "consumed": {
+    "messages_seen": 260,
+    "logical_aggregates": 130,
+    "revisions": 130,
+    "station_windows": 120,
+    "basin_windows": 10,
+    "alerts": 0
+  }
+}
+{"state": "DONE"}
+{
+  "produced": {
+    "events": 127,
+    "duplicates": 7,
+    "delayed": 83
+  },
+  "consumed": {
+    "messages_seen": 258,
+    "logical_aggregates": 129,
+    "revisions": 129,
+    "station_windows": 120,
+    "basin_windows": 9,
+    "alerts": 0
+  }
+}
