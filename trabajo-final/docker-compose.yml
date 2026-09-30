@@ -7,6 +7,9 @@ x-lab-environment: &lab-environment
   KAFKA_DLQ_TOPIC: ema.lecturas.dlq.v1
   BEAM_JOB_ENDPOINT: beam-job-server:8099
   BEAM_PARALLELISM: "${BEAM_PARALLELISM:-2}"
+  # use_sdf_read (por defecto) o use_deprecated_read: con esta última los
+  # checkpoints de Flink se completan (README §7, semántica de entrega).
+  BEAM_KAFKA_READ: "${BEAM_KAFKA_READ:-use_sdf_read}"
   WINDOW_SECONDS: "600"
   HOURLY_WINDOW_SECONDS: "3600"
   ALLOWED_LATENESS_SECONDS: "1200"
@@ -68,11 +71,13 @@ services:
     entrypoint: ["/bin/bash", "-ec"]
     command:
       - |
+        # KAFKA_RAW_PARTITIONS=1 para datasets con menos estaciones que
+        # particiones: una partición sin datos frena el watermark (README §7).
         for topic in ema.lecturas.v1 ema.lecturas.dlq.v1; do
           /opt/kafka/bin/kafka-topics.sh \
             --bootstrap-server kafka:9092 \
             --create --if-not-exists \
-            --topic "$$topic" --partitions 4 --replication-factor 1
+            --topic "$$topic" --partitions ${KAFKA_RAW_PARTITIONS:-4} --replication-factor 1
         done
         # Los agregados se compactan: por cada aggregate_id queda el último pane.
         /opt/kafka/bin/kafka-topics.sh \

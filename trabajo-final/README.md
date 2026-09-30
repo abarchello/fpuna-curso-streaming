@@ -11,6 +11,10 @@ subcuenca cada hora, además de alertas de lluvia intensa y de ráfagas. Es la
 continuación de las Tareas 1 a 3: el mismo dominio, las mismas reglas de
 tiempo y la misma clave idempotente.
 
+El documento técnico breve (problema, arquitectura, contrato, tiempo,
+semántica, pruebas y límites) está en
+[`docs/documento_tecnico.pdf`](docs/documento_tecnico.pdf).
+
 ![Arquitectura](img/arquitectura.png)
 
 ## 1. Motivación
@@ -266,6 +270,29 @@ ráfaga fuerte, que con la serie de sólo lluvia no podía aparecer. La salida,
 el control de calidad y la calibración de la lateness están en
 [`docs/evidencia_ftp.txt`](docs/evidencia_ftp.txt).
 
+### En streaming sobre Flink
+
+Ensayo con la pila de Docker: el job desde el notebook 2 y el replay de un
+día de la serie de lluvia (3 de febrero de 2026, 12 estaciones) a 600×.
+
+- Se publicaron 1 618 eventos: 34 duplicados y 1 122 con atraso de enlace.
+- Las 1 584 ventanas de estación del día aparecieron en `ema.agregados.v1`
+  con sus panes EARLY, que se actualizan cada 10 segundos, y ninguna quedó
+  con más de una lectura: los duplicados no sumaron.
+- Salieron las alertas de lluvia intensa del día y los agregados por
+  subcuenca.
+- Un evento roto mandado con `kafka-console-producer` llegó a
+  `ema.lecturas.dlq.v1` con el motivo del rechazo.
+
+Lo que no conseguí en Flink es que cierren las ventanas mientras corre la
+demo: no llegan panes ON_TIME ni LATE. El watermark que calcula KafkaIO en
+el runner portable queda atado a la hora del reloj en lugar de seguir el
+tiempo de evento, y como el replay va acelerado, el tiempo de evento está
+horas por delante. Probé las dos lecturas de KafkaIO (SDF y clásica) y en
+las dos pasa lo mismo. El comportamiento de las ventanas con el watermark
+(ON_TIME, LATE acumulado, descarte más allá de la lateness) está probado con
+`TestStream` (pruebas más abajo) y en las referencias en batch.
+
 ### Con datos sintéticos
 
 Para comprobarlo sin los datos reales, `make dataset-sintetico` y `make local`
@@ -346,6 +373,18 @@ emiten con la misma cadencia y no hay claves calientes. El pipeline corre con
 paralelismo 2 por defecto, y con 4 particiones puedo subirlo a 4 sin
 reparticionar. Más particiones que estaciones no agregarían paralelismo útil.
 
+Con pocas estaciones pasa lo contrario: el watermark de KafkaIO es el mínimo
+entre particiones, y una partición que no recibe nada lo deja atado al reloj.
+Como el replay va acelerado, el tiempo de evento corre por delante del reloj
+y las ventanas no cerrarían. Las 3 estaciones de la sección 8.2 caen en 2 de
+las 4 particiones, así que para ese dataset levanto la pila con una sola
+partición de entrada:
+
+```bash
+docker compose down --volumes
+KAFKA_RAW_PARTITIONS=1 docker compose up -d   # PowerShell: $env:KAFKA_RAW_PARTITIONS="1"
+```
+
 ### Semántica de entrega y límites
 
 No afirmo exactly-once de punta a punta, porque no lo es. Lo que hay es esto:
@@ -353,17 +392,23 @@ No afirmo exactly-once de punta a punta, porque no lo es. Lo que hay es esto:
 - El productor del replay y el `WriteToKafka` de los agregados usan
   `enable.idempotence=true` y `acks=all`: un reintento del productor no
   duplica mensajes en el broker.
-- La lectura con KafkaIO confirma offsets con `enable.auto.commit`, y en el
-  laboratorio no activé checkpoints de Flink. Si un TaskManager se cae, el job
-  se reinicia desde el último offset confirmado: algunas lecturas se vuelven
-  a procesar (el estado de deduplicación de ese momento se pierde) y algunos
-  panes se vuelven a publicar. Es at-least-once hacia `ema.agregados.v1`.
+- La lectura con KafkaIO confirma offsets con `enable.auto.commit`. Flink
+  tiene checkpoints cada 30 segundos (`docker/flink/flink-conf.yaml`, que
+  viene del laboratorio de la clase 7), pero con la lectura SDF de KafkaIO
+  en el runner portable no llegan a completarse: vencen a los 3 minutos. Con
+  `BEAM_KAFKA_READ=use_deprecated_read` (la lectura clásica) sí se
+  completan, aunque no lo probé más allá de un ensayo. No cuento con ellos:
+  si un TaskManager se cae, el job se reinicia desde el último offset
+  confirmado, algunas lecturas se vuelven a procesar (el estado de
+  deduplicación de ese momento se pierde) y algunos panes se vuelven a
+  publicar. Es at-least-once hacia `ema.agregados.v1`.
 - La vista final es idempotente: el consumidor aplica cada pane con upsert
   por `aggregate_id` e ignora los `pane_index` viejos, y el tópico es
   compactado. Reprocesar o republicar un pane no cambia el resultado visible.
-- En producción activaría el checkpointing de Flink (`--checkpointing_interval`)
-  y el commit de offsets en la finalización del checkpoint, para que estado y
-  offsets se restauren juntos.
+- En producción haría que los checkpoints se completen (lectura clásica o un
+  runner con soporte completo de SDF) y confirmaría offsets al finalizar cada
+  checkpoint (`commit_offset_in_finalize`), para que estado y offsets se
+  restauren juntos.
 
 Otros límites que conviene tener presentes:
 

@@ -1,47 +1,42 @@
-%%{init: {"theme": "neutral", "flowchart": {"curve": "basis", "nodeSpacing": 28, "rankSpacing": 40}}}%%
-flowchart LR
-    subgraph DATOS["Datos"]
-        OM["Open-Meteo / ERA5<br/>horario, 12 puntos"]
-        SYN["Generador sintético<br/>(sin red)"]
-        CSV["Export EMAS real<br/>(adaptador CSV)"]
-        DS["dataset.py<br/>emas_10min.parquet<br/>12 estaciones × 10 min"]
-        OM --> DS
-        SYN --> DS
-        CSV --> DS
+%%{init: {"theme": "neutral", "flowchart": {"curve": "basis", "nodeSpacing": 22, "rankSpacing": 30, "wrappingWidth": 260}}}%%
+flowchart TB
+    subgraph DATOS["1 · Datos: dataset.py → emas_10min.parquet"]
+        direction LR
+        OM["Open-Meteo / ERA5 o sintético<br/>(público, reproducible)"]
+        CSV["Lluvia real, 12 estaciones, 2 años<br/>(adaptador csv)"]
+        FTP["Archivos de transmisión, 3 estaciones<br/>hora de envío + control de calidad (ftp)"]
     end
 
-    subgraph PROD["marimo 1 · productor"]
-        REP["producer.py — replay<br/>aceleración · duplicados<br/>atraso por enlace"]
-    end
-    DS --> REP
+    REP["2 · Productor (marimo 1): replay acelerado<br/>2 % duplicados · atraso real o por tipo de enlace"]
+    OM --> REP
+    CSV --> REP
+    FTP --> REP
 
-    subgraph KAFKA["Apache Kafka (KRaft)"]
-        T1[("ema.lecturas.v1<br/>key = station_id · 4 part.")]
-        DLQ[("ema.lecturas.dlq.v1")]
-        T2[("ema.agregados.v1<br/>key = aggregate_id")]
-    end
+    T1[("3 · Kafka: ema.lecturas.v1<br/>clave station_id · 4 particiones · timestamp = event_time")]
     REP --> T1
 
-    subgraph BEAM["marimo 2 · pipeline Beam (PortableRunner → Flink)"]
-        P1["KafkaIO (Java) →<br/>ParseEvent → DLQ"]
-        P2["event_time →<br/>FixedWindows 10 min<br/>early / on-time / late"]
-        P3["DeduplicateReadings<br/>estado + timer"]
-        P4["CombinePerKey<br/>StationStatsCombineFn"]
-        P5["re-ventaneo 1 h →<br/>BasinStatsCombineFn"]
-        P6["detect_alerts<br/>umbrales"]
-        P1 --> P2 --> P3 --> P4
+    subgraph BEAM["4 · Apache Beam 2.74 sobre Flink (marimo 2)"]
+        direction LR
+        P1["KafkaIO →<br/>ParseEvent"]
+        P2["event_time ·<br/>ventanas 10 min ·<br/>early / on-time / late"]
+        P3["Deduplicar<br/>estado + timer"]
+        P4["CombinePerKey<br/>por estación"]
+        P5["ventana 1 h<br/>por subcuenca"]
+        P6["alertas lluvia<br/>y ráfaga"]
+        P1 --> P2 --> P3 --> P4 --> P6
         P3 --> P5
-        P4 --> P6
     end
     T1 --> P1
-    P1 -.-> DLQ
+
+    subgraph SALIDA["5 · Kafka: salida"]
+        direction LR
+        DLQ[("ema.lecturas.dlq.v1<br/>inválidos + motivo")]
+        T2[("ema.agregados.v1<br/>clave aggregate_id · compactado")]
+    end
+    P1 -. inválidos .-> DLQ
     P4 --> T2
     P5 --> T2
     P6 --> T2
 
-    subgraph ANA["marimo 3 · analítica"]
-        ST["AggregateStore<br/>upsert por aggregate_id"]
-        DASH["gráficos por estación /<br/>subcuenca · alertas"]
-        ST --> DASH
-    end
-    T2 --> ST
+    DASH["6 · Consumidor (marimo 3): upsert por aggregate_id,<br/>descarta panes viejos · tablero por estación, subcuenca y alertas"]
+    T2 --> DASH
