@@ -21,7 +21,7 @@ from apache_beam.options.pipeline_options import PipelineOptions
 
 from hidromet_streaming.config import Settings, processed_dataset_path, project_root
 from hidromet_streaming.contracts import encode_event
-from hidromet_streaming.producer import StationReplay, load_readings
+from hidromet_streaming.producer import StationReplay, load_arrival_delays, load_readings
 from hidromet_streaming.transforms import ParseEvent, build_analytics
 
 
@@ -31,12 +31,22 @@ def main() -> None:
     parser.add_argument("--max-readings", type=int)
     parser.add_argument("--duplicate-rate", type=float, default=0.02)
     parser.add_argument(
+        "--simulated-delays",
+        action="store_true",
+        help="usar el atraso simulado por enlace aunque el dataset traiga arrival_time",
+    )
+    parser.add_argument(
         "--output", type=Path, default=project_root() / "data/processed/agregados_local.parquet"
     )
     args = parser.parse_args()
 
     settings = Settings.from_env()
     readings, links = load_readings(args.dataset, max_readings=args.max_readings)
+    arrival_delays = (
+        {}
+        if args.simulated_delays
+        else load_arrival_delays(args.dataset, max_readings=args.max_readings)
+    )
 
     # Reutilizamos el planificador del productor para obtener el orden de
     # publicación (con atrasos por enlace) y los duplicados, sin Kafka.
@@ -60,6 +70,7 @@ def main() -> None:
         speedup=1e9,
         duplicate_rate=args.duplicate_rate,
         link_delays=links,
+        arrival_delays=arrival_delays,
         seed=7,
     )
     # Orden de publicación con atrasos por enlace, conservando las fechas
@@ -73,6 +84,7 @@ def main() -> None:
         "events": len(collector.records),
         "duplicates": replay.duplicates,
         "delayed": replay.delayed,
+        "real_arrival_delays": len(arrival_delays),
     }
     # Un evento corrupto para ejercitar la DLQ.
     collector.records.append((b"ITA99", b'{"event_id": "roto", "event_type": "ema.lectura"}'))

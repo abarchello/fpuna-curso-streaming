@@ -7,6 +7,7 @@ from hidromet_streaming.contracts import PHYSICAL_RANGES
 from hidromet_streaming.dataset import (
     STATIONS,
     disaggregate_to_10min,
+    from_ftp_long,
     prepare_dataset,
     synthetic_station,
 )
@@ -81,3 +82,51 @@ def test_csv_source_clips_period_and_takes_metadata_from_catalog(tmp_path, monke
     assert by_id.loc["ITA07", "subcuenca"] == "margen-derecha-centro"
     dataset = pd.read_parquet(tmp_path / "data/processed/emas_10min.parquet")
     assert dataset["temp_c"].isna().all()  # el export sólo trae lluvia
+
+
+def test_ftp_long_export_applies_qc_and_keeps_first_arrival(tmp_path):
+    t0 = datetime(2026, 8, 1, 10, 0)
+    t1 = datetime(2026, 8, 1, 10, 10)
+    sent = datetime(2026, 8, 1, 10, 2)
+    resent = datetime(2026, 8, 1, 10, 30)
+    rows = [
+        # estación con hora de envío (un archivo por transmisión)
+        ("6000000001", t0, "0003", "0.4", sent),
+        ("6000000001", t0, "0008", "21.5", sent),
+        ("6000000001", t0, "0013", "[01]", sent),  # código de estado del sensor
+        ("6000000001", t0, "0010", "900.0", sent),  # presión fuera de rango
+        ("6000000001", t0, "0003", "0.4", resent),  # la misma medición, reenviada
+        ("6000000001", t1, "0003", "1.2", datetime(2026, 8, 1, 10, 11)),
+        ("6000000001", t1, "0013", "-1.2", datetime(2026, 8, 1, 10, 11)),  # offset nocturno
+        ("6000000001", t1, "0032", "12.7", datetime(2026, 8, 1, 10, 11)),  # batería: se ignora
+        # estación de archivos diarios, sin hora de envío
+        ("6000000002", t0, "0003", "0.0", None),
+        ("6000000002", t0, "0010", "999", None),  # centinela
+        ("6000000002", t0, "0002", "-3", None),  # dirección imposible
+        ("6000000009", t0, "0003", "5.0", None),  # fuera del mapa: se ignora
+    ]
+    path = tmp_path / "largo.parquet"
+    pd.DataFrame(
+        rows, columns=["estacion", "ts", "sensor", "valor_texto", "enviado_en"]
+    ).to_parquet(path)
+
+    frame, info = from_ftp_long(path, {"6000000001": "ITA01", "6000000002": "ITA02"})
+
+    assert len(frame) == 3
+    by_key = frame.set_index(["station_id", frame["event_time"].dt.strftime("%H:%M")])
+    first = by_key.loc[("ITA01", "10:00")]
+    assert first["precip_mm"] == 0.4 and first["temp_c"] == 21.5
+    assert np.isnan(first["radiacion_wm2"]) and np.isnan(first["presion_hpa"])
+    assert first["flag_qc"] == "QC:presion_hpa"
+    assert str(first["arrival_time"]) == "2026-08-01 10:02:00+00:00"  # el primer envío
+    second = by_key.loc[("ITA01", "10:10")]
+    assert second["radiacion_wm2"] == 0.0 and second["flag_qc"] == "OK"
+    daily = by_key.loc[("ITA02", "10:00")]
+    assert np.isnan(daily["presion_hpa"]) and np.isnan(daily["viento_dir_deg"])
+    assert daily["flag_qc"] == "QC:viento_dir_deg"
+    assert pd.isna(daily["arrival_time"])
+    assert info["non_numeric_values"] == 1
+    assert info["sentinel_values"] == 1
+    assert info["night_radiation_set_to_zero"] == 1
+    assert info["qc_nulled_by_variable"] == {"presion_hpa": 1, "viento_dir_deg": 1}
+    assert info["readings_with_arrival_time"] == 2

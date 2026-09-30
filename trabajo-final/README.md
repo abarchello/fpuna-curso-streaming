@@ -38,7 +38,7 @@ minutos, o ráfagas de 20 m/s o más, en esta versión).
 
 `dataset.py` genera `data/processed/emas_10min.parquet`: lecturas cada 10
 minutos con hasta 8 variables, de las cuales sólo la precipitación es
-obligatoria. Hay cuatro fuentes posibles y todas producen el mismo esquema:
+obligatoria. Hay cinco fuentes posibles y todas producen el mismo esquema:
 
 - **`openmeteo`** (por defecto). Reanálisis ERA5 bajado de la API pública de
   Open-Meteo (no necesita clave) para 12 localidades del Alto Paraná. Los
@@ -57,14 +57,20 @@ obligatoria. Hay cuatro fuentes posibles y todas producen el mismo esquema:
 - **`marr`**. Adaptador para un export en formato largo: una fila por
   estación, instante y variable, separador `;`, coma decimal y fechas en hora
   local.
+- **`ftp`**. Adaptador para los archivos de transmisión de las estaciones,
+  pasados a formato largo (una fila por estación, instante y sensor) con la
+  hora de envío de cada transmisión. Esa hora queda en `arrival_time`, y el
+  productor la usa como atraso real. Es la segunda fuente de datos reales de
+  la sección 8.
 
 A cada estación le asigno un tipo de enlace (`fibra`, `gprs` o `satelital`).
 El productor (`producer.py`) publica las lecturas en `ema.lecturas.v1` con
 clave `station_id` y con el `event_time` como timestamp de Kafka. Acelera el
 tiempo (60 veces por defecto), mete un 2 % de duplicados y atrasa cada
 lectura según su tipo de enlace, de modo que el orden de publicación ya no
-coincide con el de medición. Así aparecen el desorden y los datos tardíos que
-el pipeline tiene que manejar.
+coincide con el de medición. Si el dataset trae la hora real de envío, esa
+lectura se publica con su atraso real en lugar del simulado. Así aparecen el
+desorden y los datos tardíos que el pipeline tiene que manejar.
 
 ## 3. Contratos
 
@@ -119,6 +125,32 @@ Es la que diseñé en la Tarea 2, ahora corriendo de verdad:
 | Lateness | 20 min | Alcanza para las estaciones satelitales cuando andan bien y limita el estado a 30 min por ventana. |
 | Deduplicación | `SetState` por `station_id` y ventana, con un timer en fin más lateness | El mismo diseño de la Tarea 3; el timer evita que el estado crezca sin límite. |
 
+### Calibración de la lateness con llegadas reales
+
+En la Tarea 2 fijé los 20 minutos con el rango de atraso de una estación
+satelital, y dije que en operación la calibraría con un percentil alto del
+atraso. Los archivos de transmisión de la sección 8.2 lo permiten: para
+`ITA08` tengo la hora de medición y la hora de envío de 8 841 lecturas.
+
+El atraso es muy desparejo. La mediana es de 0,9 minutos y el p95 de 2,8,
+pero el p99 llega a 294,6 minutos y el máximo a 874 (14,6 horas): son los
+cortes de enlace, después de los cuales la estación manda todo lo acumulado
+junto. Con una lectura que se descarta si su atraso supera el fin de su
+ventana más la lateness, quedarían afuera:
+
+| Lateness | Lecturas de `ITA08` afuera |
+|---:|---:|
+| 20 min (la actual) | 172 (1,95 %) |
+| 60 min | 149 (1,69 %) |
+| 300 min | 86 (0,97 %) |
+| 900 min | 0 |
+
+Subir la lateness al p99 (unas 5 horas) multiplica por diez el tiempo que el
+estado de cada ventana queda abierto y recupera apenas un punto porcentual:
+los atrasos grandes no son una cola suave sino cortes. Por eso mantengo los
+20 minutos y trato lo que llega después de un corte como un problema aparte
+(sección 7, límites). Los números están en `docs/evidencia_ftp.txt`.
+
 ## 5. Cómo ejecutarlo
 
 ### Todo junto con Docker Compose
@@ -134,8 +166,17 @@ docker compose up --build
 `dataset-init` baja los datos de Open-Meteo, o genera los sintéticos si no hay
 internet (con `HIDROMET_DATASET_SOURCE=sintetico` se fuerza esa opción). Si ya
 existe `data/processed/emas_10min.parquet` no lo toca, así que un dataset
-preparado a mano (por ejemplo, el de datos reales de la sección 8) se mantiene
-y es el que reproduce el productor.
+preparado a mano (por ejemplo, el de datos reales de la sección 8) se mantiene.
+
+Se pueden tener varios datasets preparados: `dataset.py --output
+data/processed/<nombre>/emas_10min.parquet` deja cada uno en su carpeta, con
+su manifiesto, y el notebook 1 tiene un selector para elegir cuál reproducir.
+Por ejemplo, un día de otra fuente para una demo corta:
+
+```bash
+uv run python -m hidromet_streaming.dataset --source sintetico --days 1 \
+  --output data/processed/demo/emas_10min.parquet
+```
 
 | Interfaz | URL |
 |---|---|
@@ -162,7 +203,7 @@ repositorio (ver `GUIA_UV.md`).
 ```bash
 uv sync --all-packages --frozen
 make dataset-sintetico         # o make dataset (Open-Meteo, con respaldo sintético)
-make test                      # 18 pruebas
+make test                      # 20 pruebas
 make local                     # pipeline completo en DirectRunner -> data/processed/agregados_local.parquet
 ```
 
@@ -174,11 +215,11 @@ referencia para comparar con la ejecución en streaming.
 
 ## 6. Resultados
 
-### Con datos reales
+### Con datos reales: lluvia de dos años
 
 Corrida de referencia (`scripts/run_local.py --max-readings 200000`) sobre las
-primeras 200 000 lecturas del dataset de la sección 8: del 1 de julio de 2024
-al 7 de enero de 2025, con 9 estaciones.
+primeras 200 000 lecturas del dataset de la sección 8.1: del 1 de julio de
+2024 al 7 de enero de 2025, con 9 estaciones.
 
 ```
 readings: 200000  published: {events: 203960, duplicates: 3960, delayed: 141145}
@@ -204,7 +245,26 @@ y la de la prueba de punta a punta con Kafka y Flink (`make smoke`) en
 
 La referencia no cubre los dos años enteros: el DirectRunner en modo batch
 tiene todos los eventos en memoria y con las 792 653 lecturas no termina. Las
-cifras del período completo están en la sección 8.
+cifras del período completo están en la sección 8.1.
+
+### Con datos reales: todas las variables y llegadas reales
+
+Corrida de referencia sobre el dataset completo de la sección 8.2 (26 640
+lecturas de 3 estaciones, con todas las variables). Las 8 841 lecturas de
+`ITA08` se publican con su atraso real; las demás, con el simulado.
+
+```
+readings: 26640  published: {events: 27147, duplicates: 507, delayed: 21101, real_arrival_delays: 8841}
+dlq_records: 2
+aggregates: 31088  by_metric_type: {estacion_10min: 26640, subcuenca_1h: 4443, alerta: 5}
+```
+
+Otra vez un agregado de estación por lectura, y la comparación con pandas
+coincide en la lluvia de cada estación (533,8 mm entre las tres), en los
+4 443 pares de subcuenca y hora y en las alertas: 4 de lluvia intensa y 1 de
+ráfaga fuerte, que con la serie de sólo lluvia no podía aparecer. La salida,
+el control de calidad y la calibración de la lateness están en
+[`docs/evidencia_ftp.txt`](docs/evidencia_ftp.txt).
 
 ### Con datos sintéticos
 
@@ -220,11 +280,13 @@ aggregates: 3255  by_metric_type: {estacion_10min: 3000, subcuenca_1h: 252, aler
 
 ### Pruebas
 
-Las 18 pruebas (`make test`) cubren el contrato (ids deterministas y rechazo
+Las 20 pruebas (`make test`) cubren el contrato (ids deterministas y rechazo
 de mensajes inválidos), el `CombineFn`, el pipeline en batch (deduplicación,
 agregados por estación y por subcuenca, alertas y DLQ), los adaptadores de
-datos (export largo, y CSV con recorte de período y metadatos de la red de
-ejemplo) y el consumidor (upsert y descarte de panes viejos). Entre ellas hay cuatro
+datos (export largo; CSV con recorte de período y metadatos de la red de
+ejemplo; archivos de transmisión con su control de calidad y la hora del
+primer envío), el productor (usa el atraso real cuando lo hay) y el
+consumidor (upsert y descarte de panes viejos). Entre ellas hay cuatro
 pruebas con `TestStream` en las que avanzo el watermark a mano: una comprueba
 que después del pane ON_TIME llega un LATE acumulado pasando por el `DoFn`
 con estado, otra que una lectura que llega pasados los 20 minutos de
@@ -251,9 +313,17 @@ Cada punto dice lo que hice, qué alternativa descarté y por qué.
   que no puedo publicar; las estaciones llevan los códigos y las localidades
   de ejemplo de las Tareas 1 y 2. Cualquiera puede reproducir el proyecto con
   Open-Meteo o con el generador.
-- **Atraso según el tipo de enlace**, en lugar de un jitter uniforme para
-  todas las estaciones. Se parece más a la realidad (pocas estaciones muy
-  atrasadas), y eso es justamente lo que pone a prueba la lateness.
+- **Atraso real donde lo hay y simulado según el tipo de enlace donde no**,
+  en lugar de un jitter uniforme para todas las estaciones. Una estación
+  manda la hora de cada transmisión, y con eso el replay reproduce sus cortes
+  y ráfagas tal como pasaron; para las demás, el perfil del enlace se parece
+  más a la realidad (pocas estaciones muy atrasadas), y eso es justamente lo
+  que pone a prueba la lateness.
+- **Control de calidad por variable en el adaptador**, en lugar de mandar a
+  la DLQ toda lectura con un valor imposible. Un sensor de presión
+  descalibrado se llevaría la lluvia de la misma lectura; así queda vacía
+  sólo esa variable, con la marca en `flag_qc`, y la DLQ queda para los
+  eventos que rompen el contrato.
 - **Promedio areal por subcuenca**, en lugar de sumar las estaciones. Sumar la
   lluvia de varias estaciones no representa nada físico.
 - **`DoFn` con estado y timer para deduplicar**, en lugar de un `GroupByKey`
@@ -295,14 +365,26 @@ No afirmo exactly-once de punta a punta, porque no lo es. Lo que hay es esto:
   y el commit de offsets en la finalización del checkpoint, para que estado y
   offsets se restauren juntos.
 
-Otros límites que conviene tener presentes: una lectura que llega después de
-fin de ventana más 20 minutos se descarta, y lo único que queda es el
-contador de elementos descartados por atraso del runner (no hay un tópico de
-auditoría para los `too_late`, como el que propuse en la Tarea 2); el dashboard vive en
-memoria y reconstruye su vista leyendo el tópico compactado desde el
-principio en cada sesión; y las alertas comparten tópico con los agregados.
+Otros límites que conviene tener presentes:
 
-## 8. Datos reales: lluvia de 12 estaciones automáticas
+- Una lectura que llega después de fin de ventana más 20 minutos se
+  descarta, y lo único que queda es el contador de elementos descartados por
+  atraso del runner. Con las llegadas reales de `ITA08` eso es cerca del 2 %
+  de sus lecturas, casi todas de después de un corte de enlace (sección 4).
+  Lo que agregaría es un tópico de auditoría para los `too_late`, como el que
+  propuse en la Tarea 2, y un reproceso por lotes que corrija esas ventanas.
+- El mapeo de los códigos de sensor a las variables del contrato lo deduje de
+  las unidades de los encabezados de los archivos diarios; no es una tabla
+  oficial.
+- Sólo una de las tres estaciones de la sección 8.2 informa la hora de envío;
+  las otras dos usan el atraso simulado.
+- El dashboard vive en memoria y reconstruye su vista leyendo el tópico
+  compactado desde el principio en cada sesión, y las alertas comparten
+  tópico con los agregados.
+
+## 8. Datos reales
+
+### 8.1 Lluvia de 12 estaciones automáticas en dos años
 
 Los datos del análisis son mediciones de lluvia cada 10 minutos de 12
 estaciones meteorológicas automáticas de Alto Paraná y Canindeyú. Fuente:
@@ -346,7 +428,8 @@ máximo es de 24,3 mm en 10 minutos.
 
 La fuente trae sólo la precipitación. Las demás variables del contrato quedan
 vacías, que es un caso previsto (sección 3), así que con estos datos los
-agregados de estación informan la lluvia y no hay alertas de ráfaga.
+agregados de estación informan la lluvia y no hay alertas de ráfaga. Las
+estaciones de la sección 8.2 sí traen todas las variables.
 
 Para preparar el dataset a partir del export:
 
@@ -376,6 +459,59 @@ cómo se relaciona con el curso:
   red de ejemplo (fibra, GPRS o satelital), y con eso el replay tiene atrasos
   y desorden para simular.
 
+### 8.2 Archivos de transmisión de 3 estaciones
+
+La misma fuente tiene los archivos que las estaciones mandan por su enlace.
+Tres estaciones tienen datos entre el 26 de julio y el 25 de septiembre de
+2026, y son tres de las doce de la sección 8.1: su lluvia coincide lectura
+por lectura con la de la serie. Traen todas las variables y vienen en dos
+formatos:
+
+- `ITA08` manda un archivo por transmisión, más o menos cada 10 minutos, con
+  la hora de envío en el nombre. De ahí sale la hora real de llegada de cada
+  lectura. Casi todos los archivos traen un solo instante, pero 102 traen de
+  2 a 6: son las ráfagas con lo acumulado después de un corte. Hay 146
+  llegadas fuera de orden, una sola retransmisión y dos huecos de 20 minutos.
+- `ITA06` e `ITA12` tienen un archivo diario del datalogger, sin huecos y sin
+  hora de envío.
+
+Los archivos se copian a una base local (DuckDB) con una herramienta que no
+está en el repositorio, y de ahí salen en formato largo para `--source ftp`.
+Nada de eso se publica.
+
+| Estación | Lecturas | Lluvia (mm) | Hora de envío |
+|---|---:|---:|---|
+| `ITA06` Itakyry | 8 900 | 154,8 | no |
+| `ITA08` Mbaracayú | 8 841 | 163,3 | sí |
+| `ITA12` Santa Rita | 8 899 | 215,7 | no |
+
+El adaptador (`from_ftp_long`) hace un control de calidad por variable antes
+de publicar:
+
+- **1 554 valores de radiación** traen un código de estado del sensor en lugar
+  de un número. Quedan vacíos.
+- **724 presiones fijas en 999**, el centinela de "sin dato". Quedan vacías.
+- **2 443 radiaciones nocturnas** entre −5 y 0 W/m², el offset del
+  piranómetro. Pasan a 0.
+- **7 344 presiones de `ITA08`** por debajo de 930 hPa, el mínimo del
+  contrato: el sensor parece descalibrado. Quedan vacías con
+  `flag_qc = QC:presion_hpa`, y la lluvia y el resto de la lectura siguen.
+- **32 direcciones de viento negativas.** Quedan vacías con `flag_qc`.
+
+Para preparar el dataset:
+
+```bash
+uv run python -m hidromet_streaming.dataset --source ftp --file largo.parquet \
+  --station-map mapa.json --output data/processed/ftp/emas_10min.parquet
+```
+
+donde `largo.parquet` tiene las columnas `estacion`, `ts`, `sensor`,
+`valor_texto` y `enviado_en`, y `mapa.json` asocia el código de cada estación
+con su `station_id`. Con `--start` y `--end` se prepara un solo día: para la
+demo uso el 3 de febrero de 2026 de la serie de lluvia (12 estaciones, 7
+ventanas de lluvia intensa) y el 10 de septiembre de 2026 de estos archivos
+(3 alertas de lluvia y atrasos reales de hasta 527 minutos en `ITA08`).
+
 ## 9. Pendiente: machine learning en streaming (clase 8)
 
 No lo implementé en esta entrega. El lugar natural para agregarlo es el
@@ -390,15 +526,15 @@ su subcuenca, o cuya temperatura no se parece a la de sus vecinas, y publicar
 src/hidromet_streaming/
   config.py         parámetros (ventanas, lateness, umbrales, tópicos)
   contracts.py      esquema del evento, validación, event_id determinista
-  dataset.py        fuentes openmeteo, sintetico, marr y csv -> parquet
-  producer.py       replay a Kafka con duplicados y atraso por enlace
+  dataset.py        fuentes openmeteo, sintetico, csv, marr y ftp -> parquet
+  producer.py       replay a Kafka con duplicados y atraso real o por enlace
   transforms.py     ParseEvent, DeduplicateReadings, CombineFns, alertas, build_analytics
   pipeline.py       Kafka -> Beam (PortableRunner/Flink) -> Kafka, con DLQ
   consumer.py       AggregateStore (upsert) y lectura del tópico
 producer_notebook.py, pipeline_notebook.py, analytics_notebook.py
 scripts/run_local.py  referencia en batch sin Kafka ni Flink
 scripts/smoke.py      prueba corta con Docker
-tests/                18 pruebas (pytest)
+tests/                20 pruebas (pytest)
 docker/flink/         imagen de Flink con los SDK de Beam
 ```
 

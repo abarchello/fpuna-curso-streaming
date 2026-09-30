@@ -1,6 +1,6 @@
 """Preparar el dataset de lecturas de 10 minutos que el productor reproduce.
 
-Cuatro fuentes, todas escriben el mismo esquema en `data/processed/emas_10min.parquet`:
+Cinco fuentes, todas escriben el mismo esquema en `data/processed/emas_10min.parquet`:
 
 - ``openmeteo``: descarga datos horarios reales (reanálisis ERA5 vía la API
   pública de Open-Meteo, sin clave) para cada estación de la red y los
@@ -17,10 +17,13 @@ Cuatro fuentes, todas escriben el mismo esquema en `data/processed/emas_10min.pa
   una fila por (estación, instante, variable), separador ``;``, decimales con
   coma, fechas ``dd/mm/aaaa`` en hora local. Se pivotea a una fila por
   (estación, instante).
+- ``ftp``: archivos de transmisión de las estaciones en formato largo (una
+  fila por estación, instante y sensor) con la hora de envío de cada
+  transmisión, que pasa a ``arrival_time`` y el productor usa como atraso real.
 
-Con ``csv`` y ``marr``, ``--start`` y ``--end`` recortan el export a ese
-período (fechas UTC, con el día de ``--end`` incluido). Los datos de esas dos
-fuentes no van en el repositorio.
+Con ``csv``, ``marr`` y ``ftp``, ``--start`` y ``--end`` recortan el export a
+ese período (fechas UTC, con el día de ``--end`` incluido). Los datos de esas
+tres fuentes no van en el repositorio.
 
 Ejecutar:
 
@@ -28,6 +31,7 @@ Ejecutar:
     python -m hidromet_streaming.dataset --source sintetico --days 3
     python -m hidromet_streaming.dataset --source csv --file export.csv --column-map mapa.json
     python -m hidromet_streaming.dataset --source marr --file export.csv --start 2025-09-01
+    python -m hidromet_streaming.dataset --source ftp --file largo.parquet --station-map mapa.json
 """
 
 from __future__ import annotations
@@ -46,7 +50,7 @@ import numpy as np
 import pandas as pd
 
 from hidromet_streaming.config import processed_dataset_path, project_root, stations_path
-from hidromet_streaming.contracts import PHYSICAL_RANGES, VARIABLES
+from hidromet_streaming.contracts import PHYSICAL_RANGES, REQUIRED_VARIABLES, VARIABLES
 
 OPEN_METEO_ARCHIVE = "https://archive-api.open-meteo.com/v1/archive"
 HOURLY_VARIABLES = {
@@ -413,6 +417,94 @@ def from_marr_long(
 
 
 # --------------------------------------------------------------------------- #
+# Fuente 5: archivos de transmisión de las estaciones (formato largo)
+# --------------------------------------------------------------------------- #
+
+# Códigos de sensor de los loggers de la red. El mapeo sale de las unidades y
+# del tipo de proceso que declaran los encabezados de los archivos diarios; es
+# un supuesto, no una tabla oficial. Los demás sensores no entran al contrato.
+SENSOR_VARIABLES = {
+    "0001": "viento_ms",
+    "0002": "viento_dir_deg",
+    "0003": "precip_mm",
+    "0004": "hr_pct",
+    "0005": "rafaga_ms",
+    "0008": "temp_c",
+    "0010": "presion_hpa",
+    "0013": "radiacion_wm2",
+}
+FTP_SENTINELS = (999.0, -999.0, -999.9, -999.99)
+NIGHT_RADIATION_FLOOR = -5.0  # W/m²: negativos leves de noche, offset del piranómetro
+
+
+def from_ftp_long(
+    path: Path, station_map: dict[str, str]
+) -> tuple[pd.DataFrame, dict[str, object]]:
+    """Adaptar los archivos de transmisión de las estaciones al esquema del proyecto.
+
+    `path` es un parquet con una fila por (estación, instante, sensor):
+    `estacion`, `ts` (UTC), `sensor`, `valor_texto` y `enviado_en`, la hora de
+    envío de la transmisión (vacía si el formato no la informa). `station_map`
+    asocia el código de la estación con el `station_id` del proyecto; las
+    estaciones que no figuran se ignoran.
+
+    Control de calidad por variable, antes de publicar:
+
+    - el texto no numérico (códigos de estado del sensor) y los centinelas
+      quedan vacíos;
+    - la radiación levemente negativa de noche pasa a 0;
+    - una variable opcional fuera de rango físico queda vacía y se anota en
+      `flag_qc`. La lectura sigue: la DLQ queda para eventos que rompen el
+      contrato.
+
+    `arrival_time` es el primer envío de cada instante: si una transmisión se
+    repite, cuenta la que llegó antes.
+    """
+    raw = pd.read_parquet(path)
+    raw = raw[raw["estacion"].astype(str).isin(station_map) & raw["sensor"].isin(SENSOR_VARIABLES)]
+    raw = raw.assign(variable=raw["sensor"].map(SENSOR_VARIABLES))
+    text = raw["valor_texto"].fillna("").astype(str).str.strip()
+    value = pd.to_numeric(text, errors="coerce")
+    non_numeric = int((value.isna() & (text != "")).sum())
+    sentinel = value.isin(FTP_SENTINELS)
+    value = value.mask(sentinel)
+    night = (raw["variable"] == "radiacion_wm2") & (value >= NIGHT_RADIATION_FLOOR) & (value < 0)
+    value = value.mask(night, 0.0)
+
+    key = ["estacion", "ts"]
+    wide = raw.assign(value=value).groupby([*key, "variable"])["value"].first().unstack()
+    wide["arrival_time"] = raw.groupby(key)["enviado_en"].min()
+    flags = pd.Series("", index=wide.index)
+    qc_nulled: dict[str, int] = {}
+    for name, (low, high) in PHYSICAL_RANGES.items():
+        if name not in wide or name in REQUIRED_VARIABLES:
+            continue
+        bad = wide[name].notna() & ~wide[name].between(low, high)
+        qc_nulled[name] = int(bad.sum())
+        wide.loc[bad, name] = np.nan
+        flags[bad] += "," + name
+    wide = wide.reset_index()
+
+    frame = pd.DataFrame()
+    frame["station_id"] = wide["estacion"].astype(str).map(station_map)
+    frame["event_time"] = pd.to_datetime(wide["ts"], utc=True)
+    for name in VARIABLES:
+        frame[name] = wide[name] if name in wide else np.nan
+    frame["flag_qc"] = [("QC:" + f.lstrip(",")) if f else "OK" for f in flags.to_numpy()]
+    frame["arrival_time"] = pd.to_datetime(wide["arrival_time"], utc=True)
+
+    info = {
+        "non_numeric_values": non_numeric,
+        "sentinel_values": int(sentinel.sum()),
+        "night_radiation_set_to_zero": int(night.sum()),
+        "qc_nulled_by_variable": {k: v for k, v in qc_nulled.items() if v},
+        "readings_with_arrival_time": int(frame["arrival_time"].notna().sum()),
+        "variables_present": sorted(v for v in VARIABLES if frame[v].notna().any()),
+    }
+    return frame, info
+
+
+# --------------------------------------------------------------------------- #
 # Orquestación
 # --------------------------------------------------------------------------- #
 
@@ -433,7 +525,7 @@ def _attach_station_metadata(frame: pd.DataFrame) -> pd.DataFrame:
     merged["lon"] = merged["lon"].fillna(0.0)
     merged = merged.sort_values(["event_time", "station_id"]).reset_index(drop=True)
     merged["seq"] = merged.groupby("station_id").cumcount() + 1
-    merged["flag_qc"] = "OK"
+    merged["flag_qc"] = merged["flag_qc"].fillna("OK") if "flag_qc" in merged else "OK"
     return merged
 
 
@@ -445,6 +537,8 @@ def prepare_dataset(
     days: int = 3,
     csv_file: Path | None = None,
     column_map: dict[str, str] | None = None,
+    station_map: dict[str, str] | None = None,
+    output: Path | None = None,
     seed: int = 20260924,
 ) -> dict[str, object]:
     root = project_root()
@@ -482,9 +576,17 @@ def prepare_dataset(
         frame = frame.dropna(subset=["event_time", "precip_mm"])
         dropped = before - len(frame)
         frames.append(frame)
+    elif source == "ftp":
+        if csv_file is None or station_map is None:
+            raise ValueError("--file y --station-map son obligatorios con --source ftp")
+        frame, extra = from_ftp_long(csv_file, station_map)
+        before = len(frame)
+        frame = frame.dropna(subset=["event_time", "precip_mm"])
+        dropped = before - len(frame)
+        frames.append(frame)
     else:
         raise ValueError(f"fuente desconocida: {source}")
-    if source in ("csv", "marr") and (start or end):
+    if source in ("csv", "marr", "ftp") and (start or end):
         clipped = clip_period(frames[0], start, end)
         outside_period = len(frames[0]) - len(clipped)
         if clipped.empty:
@@ -492,14 +594,15 @@ def prepare_dataset(
         frames = [clipped]
 
     dataset = _attach_station_metadata(pd.concat(frames, ignore_index=True))
-    output = processed_dataset_path()
+    stations_file = output.parent / "estaciones.csv" if output else stations_path()
+    output = output or processed_dataset_path()
     output.parent.mkdir(parents=True, exist_ok=True)
     dataset.to_parquet(output, index=False)
     (
         dataset[["station_id", "station_name", "subcuenca", "lat", "lon", "enlace"]]
         .drop_duplicates("station_id")
         .sort_values("station_id")
-        .to_csv(stations_path(), index=False)
+        .to_csv(stations_file, index=False)
     )
 
     manifest = {
@@ -520,7 +623,7 @@ def prepare_dataset(
     if source == "openmeteo":
         manifest["upstream"] = OPEN_METEO_ARCHIVE
         manifest["license"] = "Open-Meteo (CC BY 4.0) sobre reanálisis ERA5 (Copernicus)"
-    if source in ("csv", "marr") and csv_file is not None:
+    if source in ("csv", "marr", "ftp") and csv_file is not None:
         manifest["csv_sha256"] = sha256(csv_file)
         manifest["csv_name"] = csv_file.name
         if start or end:
@@ -529,12 +632,14 @@ def prepare_dataset(
                 "end": end,
                 "rows_outside_period": outside_period,
             }
-    if source == "marr":
+    if source in ("marr", "ftp"):
         manifest.update(extra)
         manifest["citation"] = (
             "Itaipú Binacional, División de Embalse (MARR.CE): mediciones meteorológicas "
             "automáticas de estaciones del área del embalse."
         )
+    if "arrival_time" in dataset:  # los conteos de calidad son del export; éste, del recorte
+        manifest["readings_with_arrival_time"] = int(dataset["arrival_time"].notna().sum())
     (output.parent / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     return manifest
 
@@ -542,7 +647,7 @@ def prepare_dataset(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--source", choices=["openmeteo", "sintetico", "csv", "marr"], default="sintetico"
+        "--source", choices=["openmeteo", "sintetico", "csv", "marr", "ftp"], default="sintetico"
     )
     parser.add_argument(
         "--start",
@@ -555,6 +660,15 @@ def main() -> None:
     parser.add_argument("--days", type=int, default=3, help="sólo para --source sintetico")
     parser.add_argument("--file", type=Path)
     parser.add_argument("--column-map", type=Path, help="JSON campo_esquema -> columna_export")
+    parser.add_argument(
+        "--station-map", type=Path, help="JSON código de estación -> station_id (--source ftp)"
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="parquet de salida; el manifiesto y estaciones.csv van al lado "
+        "(por defecto data/processed/emas_10min.parquet)",
+    )
     parser.add_argument("--seed", type=int, default=20260924)
     parser.add_argument(
         "--skip-if-exists",
@@ -568,7 +682,8 @@ def main() -> None:
     )
     args = parser.parse_args()
     column_map = json.loads(args.column_map.read_text()) if args.column_map else None
-    existing = processed_dataset_path()
+    station_map = json.loads(args.station_map.read_text()) if args.station_map else None
+    existing = args.output or processed_dataset_path()
     if args.skip_if_exists and existing.exists() and existing.stat().st_size > 0:
         manifest_path = existing.parent / "manifest.json"
         current = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
@@ -586,6 +701,8 @@ def main() -> None:
             days=args.days,
             csv_file=args.file,
             column_map=column_map,
+            station_map=station_map,
+            output=args.output,
             seed=args.seed,
         )
     except (OSError, ValueError, KeyError) as error:
@@ -593,7 +710,7 @@ def main() -> None:
             raise
         print(json.dumps({"warning": f"{type(error).__name__}: {error}", "fallback": "sintetico"}))
         manifest = prepare_dataset(
-            source="sintetico", start=args.start, days=args.days, seed=args.seed
+            source="sintetico", start=args.start, days=args.days, output=args.output, seed=args.seed
         )
     print(json.dumps(manifest, indent=2))
 

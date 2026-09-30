@@ -40,16 +40,36 @@ def _(mo):
 
 
 @app.cell
-def _(json, pd, processed_dataset_path):
-    dataset_path = processed_dataset_path()
-    readings = pd.read_parquet(dataset_path).sort_values(["event_time", "station_id"])
-    manifest_path = dataset_path.parent / "manifest.json"
-    manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
-    return manifest, readings
+def _(mo, processed_dataset_path):
+    # Cada dataset preparado vive en data/processed/ o en una subcarpeta (--output).
+    processed_dir = processed_dataset_path().parent
+    candidates = sorted(processed_dir.rglob("*.parquet")) or [processed_dataset_path()]
+    candidates = [p for p in candidates if not p.name.startswith("agregados")] or candidates
+    dataset_options = {str(p.relative_to(processed_dir)): str(p) for p in candidates}
+    default_choice = processed_dataset_path().name
+    dataset_choice = mo.ui.dropdown(
+        options=dataset_options,
+        value=default_choice if default_choice in dataset_options else next(iter(dataset_options)),
+        label="Dataset a reproducir",
+    )
+    dataset_choice
+    return (dataset_choice,)
 
 
 @app.cell
-def _(alt, manifest, mo, readings):
+def _(dataset_choice, json, pd):
+    from pathlib import Path
+
+    dataset_path = Path(dataset_choice.value)
+    readings = pd.read_parquet(dataset_path).sort_values(["event_time", "station_id"])
+    manifest_path = dataset_path.parent / "manifest.json"
+    manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
+    real_arrivals = int(readings["arrival_time"].notna().sum()) if "arrival_time" in readings else 0
+    return dataset_path, manifest, readings, real_arrivals
+
+
+@app.cell
+def _(alt, manifest, mo, readings, real_arrivals):
     precip_by_station = (
         readings.groupby(["station_id", "station_name", "enlace"], as_index=False)["precip_mm"]
         .sum()
@@ -73,7 +93,9 @@ def _(alt, manifest, mo, readings):
 
                 **{len(readings):,} lecturas** de **{readings.station_id.nunique()} estaciones**
                 (fuente: `{manifest.get("source", "?")}`)
-                `{readings.event_time.min()}` → `{readings.event_time.max()}`
+                `{readings.event_time.min()}` → `{readings.event_time.max()}`.
+                Lecturas con hora de envío real (`arrival_time`): **{real_arrivals:,}**;
+                las demás usan el atraso simulado por tipo de enlace.
                 """
             ),
             source_chart,
@@ -106,7 +128,7 @@ def _(mo):
         0.0, 0.10, value=0.02, step=0.01, label="Probabilidad de duplicado"
     )
     jitter = mo.ui.slider(0.0, 3.0, value=0.0, step=0.25, label="Jitter de llegada (s)")
-    link_delays = mo.ui.checkbox(value=True, label="Simular atraso por tipo de enlace")
+    link_delays = mo.ui.checkbox(value=True, label="Atrasos de llegada (reales o por enlace)")
     start_producer = mo.ui.run_button(label="▶ Iniciar replay")
     stop_producer = mo.ui.run_button(label="■ Detener replay")
     refresh_log = mo.ui.run_button(label="↻ Actualizar estado")
@@ -121,7 +143,9 @@ def _(mo):
                 Beam los reconoce como reintentos del mismo evento lógico. Con el
                 atraso por enlace activado, las estaciones satelitales llegan
                 entre 10 y 35 minutos (lógicos) tarde: algunas superan la
-                lateness de 20 minutos y quedan fuera de su ventana.
+                lateness de 20 minutos y quedan fuera de su ventana. Las
+                lecturas que traen su hora de envío real se publican con ese
+                atraso, que a veces es de horas.
                 """
             ),
             mo.hstack([speedup, max_readings, duplicate_rate, jitter], widths="equal"),
@@ -148,6 +172,7 @@ def _(ManagedProcess):
 
 @app.cell
 def _(
+    dataset_path,
     duplicate_rate,
     jitter,
     link_delays,
@@ -166,6 +191,8 @@ def _(
             sys.executable,
             "-m",
             "hidromet_streaming.producer",
+            "--dataset",
+            str(dataset_path),
             "--max-readings",
             str(int(max_readings.value)),
             "--speedup",

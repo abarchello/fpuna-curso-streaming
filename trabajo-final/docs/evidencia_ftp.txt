@@ -1,0 +1,59 @@
+Corrida de referencia local (DirectRunner en modo batch, sin Kafka ni Flink) con los archivos de
+transmisión de 3 estaciones y sus atrasos reales de llegada.
+Comando: uv run python scripts/run_local.py --dataset data/processed/ftp/emas_10min.parquet
+Dataset: --source ftp, 2026-07-26 a 2026-09-25, 26 640 lecturas de ITA06, ITA08 e ITA12 con todas
+las variables (no se publica). ITA08 trae la hora real de envío de cada transmisión.
+Fecha: 2026-09-30  ·  código de salida: 0
+
+{
+  "readings": 26640,
+  "published": {
+    "events": 27147,
+    "duplicates": 507,
+    "delayed": 21101,
+    "real_arrival_delays": 8841
+  },
+  "dlq_records": 2,
+  "aggregates": 31088,
+  "by_metric_type": {
+    "estacion_10min": 26640,
+    "subcuenca_1h": 4443,
+    "alerta": 5
+  }
+}
+
+Comprobación con un cálculo aparte en pandas sobre las mismas lecturas (sin Beam):
+
+  agregados de estación                 26 640   claves únicas: 26 640   con más de una lectura: 0
+  lluvia total, pipeline y pandas (mm)   533,8   igual estación por estación
+  agregados de subcuenca por hora        4 443   pares (subcuenca, hora) en pandas: 4 443
+  alertas de lluvia intensa                  4   lecturas con 10 mm o más en pandas: 4
+  alertas de ráfaga fuerte                   1   lecturas con ráfaga de 20 m/s o más: 1
+
+Control de calidad del adaptador (sobre todo el export):
+
+  valores no numéricos (códigos de estado del sensor)     1 554   -> vacío
+  centinelas (999)                                          724   -> vacío
+  radiación nocturna entre -5 y 0 W/m²                     2 443   -> 0
+  presión fuera de rango (ITA08)                           7 344   -> vacío, flag_qc = QC:presion_hpa
+  dirección de viento fuera de rango                          32   -> vacío, flag_qc = QC:viento_dir_deg
+
+Atraso real de llegada de ITA08 (hora de envío - hora de medición), 8 841 lecturas:
+
+  p50 0,9 min · p90 2,3 min · p95 2,8 min · p99 294,6 min · máximo 874 min
+
+Lecturas de ITA08 que quedarían fuera de su ventana según la lateness (aproximación: una lectura
+se descarta si su atraso supera el fin de su ventana de 10 minutos más la lateness):
+
+  lateness     lecturas afuera     % de ITA08
+     0 min           260             2,94 %
+    10 min           185             2,09 %
+    20 min           172             1,95 %   <- la que usa el pipeline
+    30 min           164             1,85 %
+    60 min           149             1,69 %
+   120 min           125             1,41 %
+   300 min            86             0,97 %
+   900 min             0             0,00 %
+
+Los 2 registros de la DLQ son los inválidos que agrega el script: un JSON al que le faltan campos y
+una lectura con temp_c = 99.

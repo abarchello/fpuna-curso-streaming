@@ -8,6 +8,9 @@ patologías reales de la telemetría:
 - **atraso por enlace**: cada estación tiene un perfil (`fibra`, `gprs`,
   `satelital`) que retiene sus lecturas cierto tiempo lógico antes de
   publicarlas, generando desorden y datos tardíos respecto del watermark;
+- **atraso real**: si el dataset trae `arrival_time` (la hora en que la
+  estación envió la lectura), esa lectura se publica con su atraso real en
+  lugar del simulado;
 - **jitter**: variación aleatoria en el instante de publicación.
 
 La clave Kafka es `station_id`: las lecturas de una estación conservan el
@@ -32,7 +35,13 @@ import pandas as pd
 from confluent_kafka import Producer
 
 from hidromet_streaming.config import Settings, processed_dataset_path
-from hidromet_streaming.contracts import StationReading, encode_event, parse_utc, reading_from_row
+from hidromet_streaming.contracts import (
+    StationReading,
+    encode_event,
+    make_event_id,
+    parse_utc,
+    reading_from_row,
+)
 
 # Atraso lógico (segundos) que impone cada tipo de enlace: (mínimo, máximo).
 LINK_DELAY_SECONDS: dict[str, tuple[int, int]] = {
@@ -62,6 +71,23 @@ def load_readings(
     return readings, links
 
 
+def load_arrival_delays(path: Path, *, max_readings: int | None = None) -> dict[str, float]:
+    """Atraso real de llegada (segundos) por `event_id`, si el dataset trae `arrival_time`."""
+    frame = pd.read_parquet(path).sort_values(["event_time", "station_id"])
+    if max_readings is not None:
+        frame = frame.head(max_readings)
+    if "arrival_time" not in frame:
+        return {}
+    known = frame[frame["arrival_time"].notna()]
+    arrival = pd.to_datetime(known["arrival_time"], utc=True)
+    event = pd.to_datetime(known["event_time"], utc=True)
+    delays = (arrival - event).dt.total_seconds().clip(lower=0)
+    return {
+        make_event_id(station, stamp): float(delay)
+        for station, stamp, delay in zip(known["station_id"], event, delays, strict=True)
+    }
+
+
 def shift_event_time(
     reading: StationReading, *, source_start: datetime, target_start: datetime
 ) -> StationReading:
@@ -83,6 +109,7 @@ class StationReplay:
         duplicate_rate: float = 0.0,
         jitter_seconds: float = 0.0,
         link_delays: dict[str, str] | None = None,
+        arrival_delays: dict[str, float] | None = None,
         simulate_links: bool = True,
         seed: int = 7,
     ) -> None:
@@ -94,6 +121,7 @@ class StationReplay:
         self.duplicate_rate = duplicate_rate
         self.jitter_seconds = jitter_seconds
         self.link_delays = link_delays or {}
+        self.arrival_delays = arrival_delays or {}
         self.simulate_links = simulate_links
         self.random = random.Random(seed)
         self.stop_event = Event()
@@ -107,6 +135,8 @@ class StationReplay:
     def _logical_delay(self, reading: StationReading) -> float:
         if not self.simulate_links:
             return 0.0
+        if reading.event_id in self.arrival_delays:
+            return self.arrival_delays[reading.event_id]
         low, high = LINK_DELAY_SECONDS.get(
             self.link_delays.get(reading.station_id, "fibra"), (0, 0)
         )
@@ -201,11 +231,21 @@ def main() -> None:
     parser.add_argument("--speedup", type=float, default=60)
     parser.add_argument("--duplicate-rate", type=float, default=0.02)
     parser.add_argument("--jitter-seconds", type=float, default=0)
-    parser.add_argument("--no-link-delays", action="store_true")
+    parser.add_argument("--no-link-delays", action="store_true", help="publicar sin atrasos")
+    parser.add_argument(
+        "--simulated-delays",
+        action="store_true",
+        help="usar el atraso simulado por enlace aunque el dataset traiga arrival_time",
+    )
     parser.add_argument("--no-realtime", action="store_true")
     parser.add_argument("--seed", type=int, default=7)
     args = parser.parse_args()
     readings, links = load_readings(args.dataset, max_readings=args.max_readings)
+    arrival_delays = (
+        {}
+        if args.simulated_delays
+        else load_arrival_delays(args.dataset, max_readings=args.max_readings)
+    )
     replay = StationReplay(
         build_producer(settings.kafka_bootstrap_servers),
         topic=settings.raw_topic,
@@ -213,6 +253,7 @@ def main() -> None:
         duplicate_rate=args.duplicate_rate,
         jitter_seconds=args.jitter_seconds,
         link_delays=links,
+        arrival_delays=arrival_delays,
         simulate_links=not args.no_link_delays,
         seed=args.seed,
     )
@@ -222,6 +263,7 @@ def main() -> None:
         json.dumps(
             {
                 "readings": len(readings),
+                "real_arrival_delays": len(arrival_delays),
                 "logical_span_hours": logical_span(readings).total_seconds() / 3600,
             }
         )
