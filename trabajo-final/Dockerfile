@@ -30,5 +30,9 @@ RUN useradd --create-home --uid 10001 student \
     && chown -R student:student /app
 USER student
 
+# El ambiente del proyecto primero en el PATH: dentro del contenedor alcanza con
+# `python -m hidromet_streaming.<módulo>` (docker compose exec ... python -m ...).
+ENV PATH="/app/.venv/bin:$PATH"
+
 EXPOSE 2718
 CMD ["/app/.venv/bin/marimo", "run", "producer_notebook.py", "--host", "0.0.0.0", "--port", "2718"]

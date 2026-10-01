@@ -161,16 +161,93 @@ los atrasos grandes no son una cola suave sino cortes. Por eso mantengo los
 
 Hace falta Docker con Compose y unos 8 GB de memoria libres. Las imágenes de
 Beam son `linux/amd64`, así que en Apple Silicon corren emuladas y el primer
-arranque tarda más.
+arranque tarda más. Los comandos van desde la carpeta `trabajo-final/`.
+
+**1. Construir las imágenes y levantar la pila.**
 
 ```bash
-docker compose up --build
+docker compose build        # la primera vez baja y compila todo; después usa la caché
+docker compose up -d        # Kafka, Flink (1 JobManager, 2 TaskManagers), job server y 3 notebooks
+docker compose ps -a        # kafka "healthy"; kafka-init y dataset-init terminan solos con "Exited (0)"
 ```
 
-`dataset-init` baja los datos de Open-Meteo, o genera los sintéticos si no hay
-internet (con `HIDROMET_DATASET_SOURCE=sintetico` se fuerza esa opción). Si ya
-existe `data/processed/emas_10min.parquet` no lo toca, así que un dataset
-preparado a mano (por ejemplo, el de datos reales de la sección 8) se mantiene.
+`kafka-init` crea los tres tópicos y `dataset-init` prepara los datos: baja
+los de Open-Meteo, o genera los sintéticos si no hay internet (con
+`HIDROMET_DATASET_SOURCE=sintetico` se fuerza esa opción). Si ya existe
+`data/processed/emas_10min.parquet` no lo toca, así que un dataset preparado
+a mano (por ejemplo, el de datos reales de la sección 8) se mantiene.
+
+**2. Mirar lo que quedó creado.**
+
+```bash
+docker compose exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --describe
+```
+
+Muestra `ema.lecturas.v1` y `ema.lecturas.dlq.v1` con 4 particiones y
+`retention.ms=-1`, y `ema.agregados.v1` con `cleanup.policy=compact`.
+
+| Interfaz | URL |
+|---|---|
+| 1. Productor (replay) | <http://localhost:2718> |
+| 2. Pipeline Beam (control) | <http://localhost:2719> |
+| 3. Consumidor analítico | <http://localhost:2720> |
+| Flink Web UI | <http://localhost:8081> |
+
+**3. Correr el pipeline.** El notebook 1 tiene dos modos (la sección 6
+explica por qué hacen falta los dos), y el orden de los pasos cambia:
+
+- **Replay acelerado** (estimaciones en vivo). Primero el job: notebook 2,
+  botón "Enviar job a Flink"; a los 60 a 80 segundos aparece como RUNNING en
+  la interfaz de Flink. Después el replay: notebook 1, botón "Iniciar
+  replay". El notebook 3 se actualiza cada 2 segundos con las estimaciones
+  (panes EARLY), las alertas y los agregados por subcuenca.
+- **Cierre de ventanas** (resultado firme). Primero el replay: notebook 1,
+  con la casilla "Cierre de ventanas" marcada, publica el período de una vez
+  con sus fechas originales. Después el job: notebook 2. Al terminar de leer
+  el log, el notebook 3 muestra los panes ON_TIME con los totales.
+
+Los botones lanzan estos mismos comandos, que también se pueden correr a
+mano:
+
+```bash
+docker compose exec -d pipeline-notebook python -m hidromet_streaming.pipeline             # enviar el job
+docker compose exec producer-notebook python -m hidromet_streaming.producer --speedup 600   # replay acelerado
+docker compose exec producer-notebook python -m hidromet_streaming.producer \
+  --keep-event-time --no-realtime --no-link-delays                                          # cierre de ventanas
+```
+
+**4. Verificar con conteos.**
+
+```bash
+docker compose exec analytics-notebook python -m hidromet_streaming.topics         # los tres tópicos
+docker compose exec analytics-notebook python -m hidromet_streaming.topics --dlq   # mensajes rechazados
+```
+
+`hidromet_streaming.topics` lee los tres tópicos y muestra sólo conteos:
+lecturas publicadas, mensajes fuera de orden por partición, `event_id`
+repetidos, panes por tipo y momento (EARLY, ON_TIME, LATE), ventanas con más
+de una lectura, alertas y lo que quedó en la DLQ. Para ver la DLQ en acción
+alcanza con mandar un evento al que le faltan campos, con el job corriendo:
+
+```bash
+echo 'ITA99|{"event_id":"ema-ITA99-roto","event_type":"ema.lectura"}' | \
+  docker compose exec -T kafka /opt/kafka/bin/kafka-console-producer.sh \
+  --bootstrap-server kafka:9092 --topic ema.lecturas.v1 \
+  --property parse.key=true --property "key.separator=|"
+```
+
+**5. Detener.**
+
+```bash
+docker compose down            # detener; el log de Kafka queda en el volumen
+docker compose down --volumes  # detener y borrar también el log (para empezar de cero)
+make smoke                     # prueba corta Kafka -> Beam/Flink -> Kafka, con su propia pila
+```
+
+Para pasar de un modo al otro conviene empezar de cero (`down --volumes` y
+`up -d`): los dos modos usan fechas distintas y el tablero las mezclaría.
+
+#### Datasets y valores iniciales
 
 Se pueden tener varios datasets preparados: `dataset.py --output
 data/processed/<nombre>/emas_10min.parquet` deja cada uno en su carpeta, con
@@ -182,32 +259,11 @@ uv run python -m hidromet_streaming.dataset --source sintetico --days 1 \
   --output data/processed/demo/emas_10min.parquet
 ```
 
-| Interfaz | URL |
-|---|---|
-| 1. Productor (replay) | <http://localhost:2718> |
-| 2. Pipeline Beam (control) | <http://localhost:2719> |
-| 3. Consumidor analítico | <http://localhost:2720> |
-| Flink Web UI | <http://localhost:8081> |
-
-El notebook 1 tiene dos modos (la sección 6 explica por qué hacen falta los
-dos):
-
-- **Replay acelerado**: primero se envía el job desde el notebook 2 (tarda
-  alrededor de un minuto en quedar RUNNING en Flink) y después se inicia el
-  replay desde el notebook 1. El notebook 3 se actualiza cada 2 segundos con
-  las estimaciones (panes EARLY), las alertas y los agregados por subcuenca.
-- **Cierre de ventanas**: se marca la casilla, se inicia el replay (publica
-  el período de una vez, con sus fechas originales) y después se envía el
-  job. Al terminar de leer el log, el notebook 3 muestra los panes ON_TIME
-  con los totales firmes.
-
-`docker compose up --build` deja la terminal ocupada con los logs (Ctrl+C
-detiene todo); con `docker compose up -d` la pila queda en segundo plano.
 Cada pestaña de un notebook es una sesión propia: al recargarla, o al
 reiniciar la pila, los controles vuelven a sus valores iniciales, y una
 pestaña abierta contra una pila anterior queda desconectada aunque se vea
-igual (hay que recargarla). Para no depender de los controles, los valores
-iniciales del notebook 1 se pueden fijar al levantar la pila:
+igual (hay que abrirla de nuevo). Para no depender de los controles, los
+valores iniciales del notebook 1 se fijan con variables al levantar la pila:
 
 | Variable | Efecto | Por defecto |
 |---|---|---|
@@ -218,17 +274,18 @@ iniciales del notebook 1 se pueden fijar al levantar la pila:
 | `BEAM_KAFKA_READ` | Lectura de KafkaIO: `use_deprecated_read` o `use_sdf_read` | `use_deprecated_read` |
 
 ```bash
-HIDROMET_DATASET=demo REPLAY_SPEEDUP=600 docker compose up -d   # PowerShell: $env:HIDROMET_DATASET="demo"; ...
-docker compose exec analytics-notebook python -m hidromet_streaming.topics
-docker compose down            # detener; el log de Kafka queda en el volumen
-docker compose down --volumes  # detener y borrar también el log
-make smoke                     # prueba corta Kafka -> Beam/Flink -> Kafka
+HIDROMET_DATASET=demo REPLAY_SPEEDUP=600 docker compose up -d
 ```
 
-`hidromet_streaming.topics` lee los tres tópicos y muestra sólo conteos:
-lecturas publicadas, mensajes fuera de orden por partición, `event_id`
-repetidos, panes por tipo y momento (EARLY, ON_TIME, LATE), ventanas con más
-de una lectura, alertas y lo que quedó en la DLQ.
+En PowerShell las variables se definen antes y quedan para toda la sesión de
+la terminal (hay que volver a poner `REPLAY_BATCH` en `0` para el otro modo):
+
+```powershell
+$env:HIDROMET_DATASET = "demo"
+$env:REPLAY_SPEEDUP = "600"
+$env:REPLAY_BATCH = "0"
+docker compose up -d
+```
 
 ### Sin Docker
 

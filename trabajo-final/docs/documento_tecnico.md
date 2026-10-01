@@ -2,7 +2,7 @@
 title: "Trabajo final - Telemetría hidrometeorológica en streaming"
 subtitle: "Documento técnico: Kafka, Apache Beam sobre Flink y Marimo"
 author: "abarchello · Streaming de datos y sus aplicaciones · MIAAD FP-UNA"
-date: "Septiembre 2026"
+date: "Octubre 2026 · versión 2"
 lang: es
 ---
 
@@ -32,16 +32,20 @@ alertas de lluvia intensa y de ráfaga, y la cantidad de lecturas inválidas.
   (Open-Meteo/ERA5 y un generador sintético) hacen el proyecto reproducible;
   las reales (sección 3) no se publican.
 - **Productor** (`producer.py`, notebook 1): reproduce un período histórico
-  como si llegara en vivo, acelerado 60 veces, con un 2 % de duplicados y el
-  atraso de cada lectura (real si se conoce, si no según el tipo de enlace).
+  como si llegara en vivo, acelerado entre 60 y 600 veces, con un 2 % de
+  duplicados y el atraso de cada lectura (real si se conoce, si no según el
+  tipo de enlace). Tiene un segundo modo, que publica el período de una vez
+  con sus fechas originales (sección 6).
 - **Kafka 4.1.1** (KRaft): tópico de entrada, tópico de salida compactado y DLQ.
 - **Pipeline** (`pipeline.py`, `transforms.py`, notebook 2): Apache Beam 2.74
   con `ReadFromKafka` (KafkaIO), sobre Flink 1.19 con el PortableRunner, en
   streaming. Valida, deduplica, agrega por ventana y detecta alertas.
 - **Consumidor** (`consumer.py`, notebook 3): dashboard que materializa la
   salida con upsert por clave.
-- **Operación**: Docker Compose levanta todo; `make smoke` prueba el recorrido
-  Kafka → Beam/Flink → Kafka.
+- **Operación**: `docker compose build` y `docker compose up -d` levantan
+  todo; `python -m hidromet_streaming.topics` resume los tres tópicos con
+  conteos (desorden, duplicados, panes, DLQ) y `make smoke` prueba el
+  recorrido Kafka → Beam/Flink → Kafka. El README trae la secuencia completa.
 
 ![Arquitectura del pipeline, de la fuente a la salida](../img/arquitectura.png)
 
@@ -74,7 +78,7 @@ en un tópico `.v2` y convive con el `.v1` mientras migran los consumidores.
 
 | Tópico | Clave | Particiones | Configuración |
 |---|---|---|---|
-| `ema.lecturas.v1` | `station_id` | 4 | timestamp de Kafka = `event_time` |
+| `ema.lecturas.v1` | `station_id` | 4 | timestamp de Kafka = `event_time`; `retention.ms=-1` |
 | `ema.agregados.v1` | `aggregate_id` | 4 | `cleanup.policy=compact` |
 | `ema.lecturas.dlq.v1` | `invalid` | 4 | `{error, payload}`: motivo y mensaje original |
 
@@ -82,7 +86,10 @@ La clave de entrada es la estación: el orden que importa es el de las
 lecturas de una misma estación, y ése se conserva dentro de su partición. Con
 12 estaciones tocan 2 o 3 por partición; todas emiten con la misma cadencia,
 así que no hay claves calientes. Con 4 particiones el paralelismo puede subir
-de 2 a 4 sin reparticionar.
+de 2 a 4 sin reparticionar. El tópico de entrada no vence por tiempo: como el
+timestamp de cada mensaje es su `event_time`, con la retención de 7 días por
+defecto Kafka borraba en minutos un replay publicado con fechas de meses
+atrás.
 
 La salida trae `aggregate_id = metric_type|window_start|dimension_id`,
 `metric_type` (`estacion_10min`, `subcuenca_1h`, `alerta`), la ventana, el
@@ -124,16 +131,17 @@ estado y offsets se restauren juntos.
 
 # 6. Pruebas y evidencia
 
-- **22 pruebas** (`make test`): contrato (ids deterministas, rechazo de
+- **24 pruebas** (`make test`): contrato (ids deterministas, rechazo de
   inválidos), `CombineFn`, pipeline en batch (deduplicación, agregados,
   alertas, DLQ), adaptadores de datos con su control de calidad, productor
-  (atraso real y replay por lotes) y consumidor (upsert, panes viejos y pane
-  vacío de cierre). Cuatro usan
+  (atraso real y replay por lotes), consumidor (upsert, panes viejos y pane
+  vacío de cierre) y resumen de tópicos. Cuatro usan
   `TestStream` y avanzan el watermark a mano: pane LATE acumulado después del
   ON_TIME, dato más tardío que la lateness descartado sin tocar el total,
   duplicado ignorado y `pane_timing` publicado con su nombre.
 - **Smoke test** (`make smoke`): Kafka → Beam sobre Flink → Kafka con Docker,
-  código de salida 0 (`docs/evidencia_smoke.txt`).
+  código de salida 0: 127 eventos con 7 duplicados y 120 ventanas de estación
+  (`docs/evidencia_smoke.txt`).
 - **Referencias con datos reales** (`scripts/run_local.py`, la misma lógica en
   batch):
 
@@ -152,9 +160,12 @@ por estación, los mismos pares de subcuenca y hora y las mismas alertas. Las
   lecturas), en dos modos. Replay acelerado a 600×: 1 618 eventos con 34
   duplicados y 1 122 atrasados, panes EARLY cada 10 s con una sola lectura
   por ventana, alertas, agregados por subcuenca y un evento roto en la DLQ
-  con su motivo. Replay por lotes con las fechas originales: las 1 584
-  ventanas cierran ON_TIME en menos de 10 s, con 144 agregados por subcuenca
-  y 7 alertas, todos firmes. Hacen falta los dos porque la política
+  con su motivo. Cierre de ventanas: el productor publica el día de una vez,
+  en orden y con sus fechas originales, y después se envía el job, que lee el
+  log desde el principio como en un reprocesamiento; al terminar cierran las
+  1 584 ventanas con su pane ON_TIME, con 144 agregados por subcuenca y 7
+  alertas. Lo repetí ocho veces desde cero y el estado final fue siempre el
+  mismo (`docs/evidencia_flink.txt`). Hacen falta los dos porque la política
   `CreateTime` de KafkaIO fija el watermark en el reloj cuando los eventos
   están en el futuro, que es lo que produce un replay desplazado a "ahora" y
   acelerado (lo verifiqué en el código de la jar con `javap`; el laboratorio
@@ -175,6 +186,8 @@ por estación, los mismos pares de subcuenca y hora y las mismas alertas. Las
   permite definir para KafkaIO.
 - Al expirar una ventana, Flink emite un pane de cierre vacío: el pipeline
   lo descarta y el consumidor lo ignora (hallazgo del ensayo).
+- El cierre de ventanas se muestra publicando en orden: no produce
+  correcciones por datos tardíos, que quedan cubiertas por `TestStream`.
 - El mapeo de códigos de sensor a variables lo deduje de las unidades de los
   encabezados de los archivos diarios; no es una tabla oficial. Sólo una
   estación informa la hora de envío.
@@ -193,3 +206,25 @@ generativa como apoyo para redactar y revisar textos, escribir y revisar
 código y pruebas, y contrastar decisiones con lo visto en clase. Las
 decisiones, la ejecución y la verificación son mías, y cada cifra sale de
 correr el código del repositorio.
+
+# 9. Cambios desde la versión del 30 de septiembre
+
+Esta es la versión 2 del documento. Después de la entrega seguí ensayando la
+demostración y corregí lo que encontré; el código y el README del
+repositorio ya lo incluyen.
+
+- **Retención del tópico de entrada.** `ema.lecturas.v1` y la DLQ se crean
+  con `retention.ms=-1`. Con la retención por tiempo, el replay con fechas
+  originales se borraba y el resultado dependía del momento: todas las
+  ventanas, una parte o ninguna.
+- **Cierre de ventanas reproducible.** El modo publica en orden de medición y
+  la secuencia es publicar primero y enviar el job después. El estado final
+  es siempre el mismo: 1 584 ventanas ON_TIME, 144 agregados por subcuenca y
+  7 alertas.
+- **Inspección con conteos.** `python -m hidromet_streaming.topics` muestra
+  mensajes por partición, desorden, `event_id` repetidos, panes por tipo y
+  momento, y la DLQ.
+- **Arranque.** Secuencia de comandos paso a paso en el README, y variables
+  (`HIDROMET_DATASET`, `REPLAY_SPEEDUP`, `REPLAY_BATCH`) para que los
+  notebooks abran con el dataset y el modo elegidos.
+- **Pruebas.** De 22 a 24.
