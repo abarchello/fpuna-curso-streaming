@@ -111,6 +111,7 @@ class StationReplay:
         link_delays: dict[str, str] | None = None,
         arrival_delays: dict[str, float] | None = None,
         simulate_links: bool = True,
+        shift_to_now: bool = True,
         seed: int = 7,
     ) -> None:
         if speedup <= 0:
@@ -123,6 +124,10 @@ class StationReplay:
         self.link_delays = link_delays or {}
         self.arrival_delays = arrival_delays or {}
         self.simulate_links = simulate_links
+        # Con fechas originales (pasadas) y publicación de una vez, el watermark
+        # de KafkaIO sigue al event_time mientras haya backlog y las ventanas
+        # cierran en orden: es la forma de ver ON_TIME y LATE en una demo corta.
+        self.shift_to_now = shift_to_now
         self.random = random.Random(seed)
         self.stop_event = Event()
         self.sent = 0
@@ -188,8 +193,10 @@ class StationReplay:
         for publish_offset, _, original in schedule:
             if self.stop_event.is_set():
                 break
-            shifted = shift_event_time(
-                original, source_start=first_event_time, target_start=target_start
+            shifted = (
+                shift_event_time(original, source_start=first_event_time, target_start=target_start)
+                if self.shift_to_now
+                else original
             )
             jitter = self.random.uniform(0, self.jitter_seconds) if self.jitter_seconds else 0.0
             due = wall_start + publish_offset / self.speedup + jitter
@@ -237,7 +244,14 @@ def main() -> None:
         action="store_true",
         help="usar el atraso simulado por enlace aunque el dataset traiga arrival_time",
     )
-    parser.add_argument("--no-realtime", action="store_true")
+    parser.add_argument(
+        "--no-realtime", action="store_true", help="publicar todo de una vez, sin esperar"
+    )
+    parser.add_argument(
+        "--keep-event-time",
+        action="store_true",
+        help="conservar las fechas originales en lugar de desplazar la primera a ahora",
+    )
     parser.add_argument("--seed", type=int, default=7)
     args = parser.parse_args()
     readings, links = load_readings(args.dataset, max_readings=args.max_readings)
@@ -255,6 +269,7 @@ def main() -> None:
         link_delays=links,
         arrival_delays=arrival_delays,
         simulate_links=not args.no_link_delays,
+        shift_to_now=not args.keep_event_time,
         seed=args.seed,
     )
     signal.signal(signal.SIGTERM, lambda *_: replay.stop())

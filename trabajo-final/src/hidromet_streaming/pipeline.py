@@ -26,7 +26,7 @@ def java_kafka_expansion_service():
         append_args=[
             "--defaultEnvironmentType=PROCESS",
             '--defaultEnvironmentConfig={"command":"/opt/apache/beam/boot"}',
-            f"--experiments={os.getenv('BEAM_KAFKA_READ', 'use_sdf_read')}",
+            f"--experiments={os.getenv('BEAM_KAFKA_READ', 'use_deprecated_read')}",
         ]
     )
 
@@ -41,7 +41,7 @@ def pipeline_options(settings: Settings, *, job_name: str) -> PipelineOptions:
             "--streaming",
             f"--parallelism={settings.parallelism}",
             f"--job_name={job_name}",
-            f"--experiments={os.getenv('BEAM_KAFKA_READ', 'use_sdf_read')}",
+            f"--experiments={os.getenv('BEAM_KAFKA_READ', 'use_deprecated_read')}",
         ]
     )
 

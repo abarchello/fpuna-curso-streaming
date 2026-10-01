@@ -26,3 +26,12 @@ def test_store_upserts_revisions_and_ignores_stale_panes():
     assert summary["messages_seen"] == 3
     assert summary["revisions"] == 1
     assert summary["station_windows"] == 1
+
+
+def test_store_ignores_the_empty_closing_pane_of_an_expired_window():
+    store = AggregateStore()
+    assert store.upsert({**aggregate(0, 4.2), "n_lecturas": 1}) is True
+    # Al expirar la ventana, el runner emite un pane sin lecturas con el mismo índice.
+    assert store.upsert({**aggregate(0, 0.0), "n_lecturas": 0}) is False
+    assert store.station_frame().iloc[0]["precip_mm"] == 4.2
+    assert store.summary()["revisions"] == 0

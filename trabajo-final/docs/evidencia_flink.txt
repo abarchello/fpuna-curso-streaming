@@ -1,0 +1,41 @@
+Ensayos en streaming con la pila de Docker (Kafka -> Beam sobre Flink -> Kafka), 2026-09-30.
+Dataset: un día de la serie de lluvia (2026-02-03), 12 estaciones, 1 584 lecturas (no se publica).
+Job enviado desde el notebook 2; replay desde el notebook 1 / `python -m hidromet_streaming.producer`.
+Conteos leídos de los tópicos con un consumidor aparte.
+
+1. Replay acelerado (600x, primera lectura desplazada a "ahora"), lectura clásica de KafkaIO
+
+  publicado: {"events": 1618, "duplicates": 34, "delayed": 1122}
+  ema.agregados.v1: 1 584 ventanas de estación con panes EARLY (2 628 mensajes), ninguna con
+    más de una lectura; agregados de subcuenca y alertas de lluvia intensa, todos EARLY
+  ema.lecturas.dlq.v1: 1 mensaje (evento sin campos obligatorios mandado con kafka-console-producer)
+  desorden en el tópico de entrada: por partición, entre 41 y 125 mensajes llegaron con un
+    timestamp anterior al del mensaje previo; 34 event_id repetidos
+  resultado: ningún pane ON_TIME ni LATE mientras corrió la demo
+
+  Causa (leída con javap en CustomTimestampPolicyWithLimitedDelay, dentro de
+  beam-sdks-java-io-expansion-service-2.74.0.jar, la política CreateTime de KafkaIO):
+    - si el mayor event_time visto está después de ahora, el watermark = ahora - maxDelay;
+    - si no hay backlog, el watermark = hora del chequeo de backlog - maxDelay;
+    - si no, watermark = mayor event_time - maxDelay (maxDelay = 0 para CreateTime).
+  Con el replay desplazado a "ahora" y acelerado, a los pocos segundos todos los eventos están
+  horas en el futuro: el watermark queda en la hora actual y las ventanas, adelante, no cierran.
+
+2. Cierre de ventanas: fechas originales, publicación de una vez (--keep-event-time --no-realtime)
+
+  publicado: {"events": 1618, "duplicates": 34, "delayed": 1122}
+  a los 10 s: 1 584 ventanas de estación con pane ON_TIME, cada una con n_lecturas = 1
+              144 agregados de subcuenca por hora (6 subcuencas x 24 h), ON_TIME
+              7 alertas de lluvia intensa, ON_TIME
+  pane LATE: ninguno (el lector consume el lote antes de la primera emisión del watermark)
+
+  Hallazgo: al expirar cada ventana el runner emitía un segundo pane ON_TIME vacío
+  (n_lecturas = 0, mismo pane_index) y el consumidor lo tomaba como revisión. Corregido:
+  el pipeline descarta los panes vacíos y el consumidor los ignora si ya tiene datos.
+
+3. Lectura SDF de KafkaIO (use_sdf_read, la del laboratorio de la clase 7)
+
+  El watermark sólo se emite al cerrar un bundle, que en el runner portable ocurre en cada
+  checkpoint de Flink; con esa lectura los checkpoints vencen (180 s) y fallan. Con la lectura
+  clásica (use_deprecated_read, por defecto en este proyecto) el watermark se emite cada 200 ms
+  y los checkpoints se completan.

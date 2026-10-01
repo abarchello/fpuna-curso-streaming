@@ -191,7 +191,11 @@ uv run python -m hidromet_streaming.dataset --source sintetico --days 1 \
 
 Primero se lanza el job desde el notebook 2, después el replay desde el
 notebook 1, y se mira el notebook 3 (se actualiza cada 2 segundos) junto con
-la interfaz de Flink.
+la interfaz de Flink. El notebook 1 tiene dos modos: el replay acelerado
+(estimaciones EARLY, duplicados, desorden y alertas en vivo) y la casilla
+"Cierre de ventanas", que publica el período de una vez con sus fechas
+originales y deja en segundos los panes ON_TIME con los totales firmes
+(sección 6 explica por qué hacen falta los dos).
 
 ```bash
 docker compose down            # detener; el log de Kafka queda en el volumen
@@ -207,7 +211,7 @@ repositorio (ver `GUIA_UV.md`).
 ```bash
 uv sync --all-packages --frozen
 make dataset-sintetico         # o make dataset (Open-Meteo, con respaldo sintético)
-make test                      # 20 pruebas
+make test                      # 22 pruebas
 make local                     # pipeline completo en DirectRunner -> data/processed/agregados_local.parquet
 ```
 
@@ -272,26 +276,57 @@ el control de calidad y la calibración de la lateness están en
 
 ### En streaming sobre Flink
 
-Ensayo con la pila de Docker: el job desde el notebook 2 y el replay de un
-día de la serie de lluvia (3 de febrero de 2026, 12 estaciones) a 600×.
+Dos corridas con la pila de Docker sobre el mismo día de la serie de lluvia
+(3 de febrero de 2026, 12 estaciones, 1 584 lecturas): el job desde el
+notebook 2 y el replay desde el notebook 1.
 
-- Se publicaron 1 618 eventos: 34 duplicados y 1 122 con atraso de enlace.
-- Las 1 584 ventanas de estación del día aparecieron en `ema.agregados.v1`
-  con sus panes EARLY, que se actualizan cada 10 segundos, y ninguna quedó
-  con más de una lectura: los duplicados no sumaron.
-- Salieron las alertas de lluvia intensa del día y los agregados por
-  subcuenca.
-- Un evento roto mandado con `kafka-console-producer` llegó a
-  `ema.lecturas.dlq.v1` con el motivo del rechazo.
+**Replay acelerado (600×, primera lectura desplazada a "ahora").** Se
+publicaron 1 618 eventos, 34 duplicados y 1 122 con atraso de enlace. Las
+1 584 ventanas aparecen en `ema.agregados.v1` con panes EARLY que se
+actualizan cada 10 segundos, ninguna con más de una lectura; salen las
+alertas y los agregados por subcuenca, y un evento roto mandado con
+`kafka-console-producer` llega a `ema.lecturas.dlq.v1` con el motivo. Pero
+las ventanas **no cierran** mientras corre la demo. La causa está en la
+política `CreateTime` de KafkaIO (`CustomTimestampPolicyWithLimitedDelay`,
+leída con `javap` de la jar que corre en Flink): si el mayor `event_time`
+visto está en el futuro, el watermark se fija en el reloj; y si el lector no
+tiene backlog, también salta al reloj. Con el replay desplazado a "ahora" y
+acelerado, a los pocos segundos todos los eventos están horas en el futuro,
+así que el watermark queda clavado en la hora actual y las ventanas, que
+están adelante, no cierran. El laboratorio de la clase 7 usa la misma
+política y el mismo replay, con el mismo efecto.
 
-Lo que no conseguí en Flink es que cierren las ventanas mientras corre la
-demo: no llegan panes ON_TIME ni LATE. El watermark que calcula KafkaIO en
-el runner portable queda atado a la hora del reloj en lugar de seguir el
-tiempo de evento, y como el replay va acelerado, el tiempo de evento está
-horas por delante. Probé las dos lecturas de KafkaIO (SDF y clásica) y en
-las dos pasa lo mismo. El comportamiento de las ventanas con el watermark
-(ON_TIME, LATE acumulado, descarte más allá de la lateness) está probado con
-`TestStream` (pruebas más abajo) y en las referencias en batch.
+**Cierre de ventanas (fechas originales, publicación de una vez).** Con la
+casilla "Cierre de ventanas" del notebook 1 (`--keep-event-time
+--no-realtime` en la línea de comandos) el productor publica el día entero
+en el orden de llegada, con sus `event_time` del pasado. Mientras hay
+backlog, el watermark sigue al tiempo de evento y en menos de 10 segundos
+cierran las 1 584 ventanas con su pane ON_TIME, cada una con una sola
+lectura (los 34 duplicados no sumaron), más 144 agregados horarios por
+subcuenca y 7 alertas de lluvia intensa, todas ON_TIME. Es el recorrido
+completo con resultado firme, y es lo que muestra el dashboard de la demo.
+
+Dos cosas que salieron de ese ensayo y quedaron en el código:
+
+- La lectura SDF de KafkaIO (`use_sdf_read`, la del laboratorio) sólo emite
+  el watermark al cerrar un bundle, y en el runner portable eso pasa en cada
+  checkpoint de Flink, que con esa lectura vence a los 3 minutos. La lectura
+  clásica (`use_deprecated_read`) lo emite cada 200 ms y completa los
+  checkpoints: es la que uso por defecto (`BEAM_KAFKA_READ`).
+- Al expirar una ventana, el runner emite un segundo pane ON_TIME **vacío**
+  (`n_lecturas = 0`, mismo `pane_index`); el consumidor lo tomaba como una
+  revisión y dejaba la ventana en cero. Ahora el pipeline descarta los panes
+  vacíos antes de publicarlos y el consumidor los ignora si ya tiene datos.
+
+Lo que esta demo no muestra son panes LATE ni descartes: el lector consume
+el lote entero antes de la primera emisión del watermark, así que nada llega
+"después". Ese comportamiento (ON_TIME, LATE acumulado y descarte pasada la
+lateness) está probado con `TestStream` (pruebas más abajo) y en las
+referencias en batch, donde los atrasos sí reordenan la llegada. Los
+conteos de los dos ensayos y el detalle de la política de KafkaIO están en
+[`docs/evidencia_flink.txt`](docs/evidencia_flink.txt), y en
+[`docs/capturas/`](docs/capturas/) hay capturas del job en Flink, de los
+controles del productor y del dashboard con las ventanas cerradas.
 
 ### Con datos sintéticos
 
@@ -307,13 +342,14 @@ aggregates: 3255  by_metric_type: {estacion_10min: 3000, subcuenca_1h: 252, aler
 
 ### Pruebas
 
-Las 20 pruebas (`make test`) cubren el contrato (ids deterministas y rechazo
+Las 22 pruebas (`make test`) cubren el contrato (ids deterministas y rechazo
 de mensajes inválidos), el `CombineFn`, el pipeline en batch (deduplicación,
 agregados por estación y por subcuenca, alertas y DLQ), los adaptadores de
 datos (export largo; CSV con recorte de período y metadatos de la red de
 ejemplo; archivos de transmisión con su control de calidad y la hora del
-primer envío), el productor (usa el atraso real cuando lo hay) y el
-consumidor (upsert y descarte de panes viejos). Entre ellas hay cuatro
+primer envío), el productor (usa el atraso real cuando lo hay y conserva las
+fechas originales en el replay por lotes) y el consumidor (upsert, descarte
+de panes viejos y del pane vacío de cierre). Entre ellas hay cuatro
 pruebas con `TestStream` en las que avanzo el watermark a mano: una comprueba
 que después del pane ON_TIME llega un LATE acumulado pasando por el `DoFn`
 con estado, otra que una lectura que llega pasados los 20 minutos de
@@ -321,11 +357,11 @@ lateness se descarta sin tocar el total, otra que un duplicado se ignora, y
 la última que la salida publica `pane_timing` con el nombre del pane
 (`ON_TIME`, `LATE`) y no con el número interno que usa Beam.
 
-> Algo que encontré con Beam 2.74 en DirectRunner: en modo batch, con
-> `ACCUMULATING` y `allowed_lateness` mayor que cero, cada ventana emite dos
-> panes con el mismo contenido, el on-time y otro de cierre con
-> `is_last=True`. Las pruebas en batch verifican el pane final, y el
-> consumidor no se ve afectado porque hace `UPSERT`. En el laboratorio de la
+> Algo que encontré con Beam 2.74: con `ACCUMULATING` y `allowed_lateness`
+> mayor que cero, cada ventana emite dos panes, el on-time y otro de cierre
+> con `is_last=True`. En DirectRunner (batch) los dos traen el mismo
+> contenido; en Flink el de cierre viene vacío. Por eso el pipeline descarta
+> los panes sin lecturas y el consumidor los ignora. En el laboratorio de la
 > clase 7 pasa lo mismo.
 
 ## 7. Decisiones
@@ -392,23 +428,19 @@ No afirmo exactly-once de punta a punta, porque no lo es. Lo que hay es esto:
 - El productor del replay y el `WriteToKafka` de los agregados usan
   `enable.idempotence=true` y `acks=all`: un reintento del productor no
   duplica mensajes en el broker.
-- La lectura con KafkaIO confirma offsets con `enable.auto.commit`. Flink
-  tiene checkpoints cada 30 segundos (`docker/flink/flink-conf.yaml`, que
-  viene del laboratorio de la clase 7), pero con la lectura SDF de KafkaIO
-  en el runner portable no llegan a completarse: vencen a los 3 minutos. Con
-  `BEAM_KAFKA_READ=use_deprecated_read` (la lectura clásica) sí se
-  completan, aunque no lo probé más allá de un ensayo. No cuento con ellos:
-  si un TaskManager se cae, el job se reinicia desde el último offset
-  confirmado, algunas lecturas se vuelven a procesar (el estado de
-  deduplicación de ese momento se pierde) y algunos panes se vuelven a
-  publicar. Es at-least-once hacia `ema.agregados.v1`.
+- La lectura con KafkaIO confirma offsets con `enable.auto.commit`,
+  independientemente de los checkpoints de Flink (cada 30 segundos,
+  `docker/flink/flink-conf.yaml`; se completan con la lectura clásica, que
+  es la que uso). Si un TaskManager se cae, el job se reinicia desde el
+  último offset confirmado, algunas lecturas se vuelven a procesar (el
+  estado de deduplicación de ese momento se pierde) y algunos panes se
+  vuelven a publicar. Es at-least-once hacia `ema.agregados.v1`.
 - La vista final es idempotente: el consumidor aplica cada pane con upsert
   por `aggregate_id` e ignora los `pane_index` viejos, y el tópico es
   compactado. Reprocesar o republicar un pane no cambia el resultado visible.
-- En producción haría que los checkpoints se completen (lectura clásica o un
-  runner con soporte completo de SDF) y confirmaría offsets al finalizar cada
-  checkpoint (`commit_offset_in_finalize`), para que estado y offsets se
-  restauren juntos.
+- En producción confirmaría los offsets al finalizar cada checkpoint
+  (`commit_offset_in_finalize`), para que estado y offsets se restauren
+  juntos.
 
 Otros límites que conviene tener presentes:
 
@@ -423,6 +455,12 @@ Otros límites que conviene tener presentes:
   oficial.
 - Sólo una de las tres estaciones de la sección 8.2 informa la hora de envío;
   las otras dos usan el atraso simulado.
+- Con la política `CreateTime` de KafkaIO, un replay acelerado no puede
+  cerrar ventanas en vivo (sección 6): la demo muestra el cierre con el
+  replay por lotes y las estimaciones con el acelerado. Para ver panes LATE
+  en Flink haría falta un replay a velocidad real, de más de media hora, o
+  una política de watermark propia, que el SDK de Python no permite definir
+  para KafkaIO.
 - El dashboard vive en memoria y reconstruye su vista leyendo el tópico
   compactado desde el principio en cada sesión, y las alertas comparten
   tópico con los agregados.
@@ -579,7 +617,7 @@ src/hidromet_streaming/
 producer_notebook.py, pipeline_notebook.py, analytics_notebook.py
 scripts/run_local.py  referencia en batch sin Kafka ni Flink
 scripts/smoke.py      prueba corta con Docker
-tests/                20 pruebas (pytest)
+tests/                22 pruebas (pytest)
 docker/flink/         imagen de Flink con los SDK de Beam
 ```
 

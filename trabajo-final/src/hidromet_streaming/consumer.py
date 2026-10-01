@@ -11,6 +11,7 @@ import pandas as pd
 from confluent_kafka import Consumer, KafkaError
 
 from hidromet_streaming.config import Settings
+from hidromet_streaming.transforms import is_empty_pane
 
 
 @dataclass
@@ -29,6 +30,10 @@ class AggregateStore:
             # Un pane viejo que llega después de uno más nuevo (reintento fuera
             # de orden) no debe pisar la revisión más reciente.
             if int(current.get("pane_index", -1)) > int(aggregate.get("pane_index", -1)):
+                return False
+            # Al expirar una ventana, el runner puede emitir un pane de cierre
+            # sin lecturas con el mismo pane_index: no trae información nueva.
+            if is_empty_pane(aggregate) and not is_empty_pane(current):
                 return False
             self.revisions += 1
         self.records[aggregate_id] = aggregate

@@ -129,6 +129,9 @@ def _(mo):
     )
     jitter = mo.ui.slider(0.0, 3.0, value=0.0, step=0.25, label="Jitter de llegada (s)")
     link_delays = mo.ui.checkbox(value=True, label="Atrasos de llegada (reales o por enlace)")
+    batch_replay = mo.ui.checkbox(
+        value=False, label="Cierre de ventanas: fechas originales, publicar de una vez"
+    )
     start_producer = mo.ui.run_button(label="▶ Iniciar replay")
     stop_producer = mo.ui.run_button(label="■ Detener replay")
     refresh_log = mo.ui.run_button(label="↻ Actualizar estado")
@@ -146,13 +149,24 @@ def _(mo):
                 lateness de 20 minutos y quedan fuera de su ventana. Las
                 lecturas que traen su hora de envío real se publican con ese
                 atraso, que a veces es de horas.
+
+                Con el replay desplazado a "ahora" los eventos quedan en el
+                futuro y el watermark de KafkaIO se limita al reloj: se ven las
+                estimaciones (panes EARLY) pero las ventanas no cierran durante
+                la demo. **Cierre de ventanas** publica el período de una vez con
+                sus fechas originales: el watermark sigue al tiempo de evento y
+                en segundos aparecen los panes ON_TIME con los totales firmes.
                 """
             ),
             mo.hstack([speedup, max_readings, duplicate_rate, jitter], widths="equal"),
-            mo.hstack([link_delays, start_producer, stop_producer, refresh_log], justify="start"),
+            mo.hstack(
+                [link_delays, batch_replay, start_producer, stop_producer, refresh_log],
+                justify="start",
+            ),
         ]
     )
     return (
+        batch_replay,
         duplicate_rate,
         jitter,
         link_delays,
@@ -172,6 +186,7 @@ def _(ManagedProcess):
 
 @app.cell
 def _(
+    batch_replay,
     dataset_path,
     duplicate_rate,
     jitter,
@@ -204,6 +219,8 @@ def _(
         ]
         if not link_delays.value:
             command.append("--no-link-delays")
+        if batch_replay.value:
+            command.extend(["--keep-event-time", "--no-realtime"])
         producer_process.start(command, log_path=project_root() / "tmp/producer.log")
     return
 

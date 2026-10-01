@@ -7,9 +7,9 @@ x-lab-environment: &lab-environment
   KAFKA_DLQ_TOPIC: ema.lecturas.dlq.v1
   BEAM_JOB_ENDPOINT: beam-job-server:8099
   BEAM_PARALLELISM: "${BEAM_PARALLELISM:-2}"
-  # use_sdf_read (por defecto) o use_deprecated_read: con esta última los
-  # checkpoints de Flink se completan (README §7, semántica de entrega).
-  BEAM_KAFKA_READ: "${BEAM_KAFKA_READ:-use_sdf_read}"
+  # Lectura de KafkaIO: use_deprecated_read (clásica, por defecto) emite el
+  # watermark cada 200 ms y completa los checkpoints; use_sdf_read no (README §6).
+  BEAM_KAFKA_READ: "${BEAM_KAFKA_READ:-use_deprecated_read}"
   WINDOW_SECONDS: "600"
   HOURLY_WINDOW_SECONDS: "3600"
   ALLOWED_LATENESS_SECONDS: "1200"

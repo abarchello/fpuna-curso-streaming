@@ -298,6 +298,12 @@ def detect_alerts(aggregate: dict[str, Any], settings: Settings):
         }
 
 
+def is_empty_pane(aggregate: dict[str, Any]) -> bool:
+    """Pane sin lecturas: lo emite el runner al expirar una ventana y no informa nada."""
+    count = aggregate.get("n_lecturas", aggregate.get("n_estaciones", 1))
+    return int(count or 0) == 0
+
+
 def build_analytics(events, settings: Settings, *, streaming_triggers: bool = True):
     """Construir agregados por estación (10 min), por subcuenca (1 h) y alertas."""
     timestamped = events | "Asignar tiempo de evento" >> beam.Map(assign_event_timestamp)
@@ -323,6 +329,7 @@ def build_analytics(events, settings: Settings, *, streaming_triggers: bool = Tr
         >> beam.Map(lambda e: ((e["station_id"], e["station_name"], e["subcuenca"]), e))
         | "Combinar métricas por estación" >> beam.CombinePerKey(StationStatsCombineFn())
         | "Formatear agregados de estación" >> beam.ParDo(FormatAggregate("estacion_10min"))
+        | "Descartar panes vacíos de estación" >> beam.Filter(lambda a: not is_empty_pane(a))
     )
 
     alerts = station_stats | "Detectar alertas" >> beam.FlatMap(detect_alerts, settings)
@@ -349,6 +356,7 @@ def build_analytics(events, settings: Settings, *, streaming_triggers: bool = Tr
         >> beam.Map(lambda e: ((e["subcuenca"], e["subcuenca"], e["subcuenca"]), e))
         | "Combinar precipitación areal" >> beam.CombinePerKey(BasinStatsCombineFn())
         | "Formatear agregados de subcuenca" >> beam.ParDo(FormatAggregate("subcuenca_1h"))
+        | "Descartar panes vacíos de subcuenca" >> beam.Filter(lambda a: not is_empty_pane(a))
     )
 
     return (station_stats, alerts, basin_stats) | "Unir registros analíticos" >> beam.Flatten()

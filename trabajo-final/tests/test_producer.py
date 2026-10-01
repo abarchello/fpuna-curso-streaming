@@ -29,3 +29,40 @@ def test_replay_uses_the_real_arrival_delay_when_the_dataset_has_it(tmp_path):
     assert [reading.station_id for _, _, reading in schedule] == ["ITA02", "ITA01"]
     assert schedule[1][0] == 3600.0
     assert replay.delayed == 1
+
+
+class _Collector:
+    def __init__(self) -> None:
+        self.values: list[bytes] = []
+
+    def produce(self, _topic, key, value, timestamp):
+        self.values.append(value)
+
+    def poll(self, _timeout):
+        return 0
+
+    def flush(self, _timeout):
+        return 0
+
+
+def test_batch_replay_keeps_the_original_event_times(tmp_path):
+    t0 = pd.Timestamp("2026-02-03T00:00:00Z")
+    pd.DataFrame(
+        {
+            "station_id": ["ITA01", "ITA01"],
+            "event_time": [t0, t0 + pd.Timedelta(minutes=10)],
+            "precip_mm": [0.0, 1.5],
+            "enlace": ["fibra", "fibra"],
+        }
+    ).to_parquet(tmp_path / "emas_10min.parquet")
+    readings, links = load_readings(tmp_path / "emas_10min.parquet", source="test")
+
+    kept = _Collector()
+    StationReplay(kept, topic="t", link_delays=links, shift_to_now=False, seed=1).replay(
+        readings, realtime=False
+    )
+    shifted = _Collector()
+    StationReplay(shifted, topic="t", link_delays=links, seed=1).replay(readings, realtime=False)
+
+    assert [b'"event_time":"2026-02-03T00:00:00Z"' in v for v in kept.values] == [True, False]
+    assert all(b"2026-02-03" not in v for v in shifted.values)  # desplazado a ahora

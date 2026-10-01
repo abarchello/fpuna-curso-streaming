@@ -111,24 +111,24 @@ un reproceso aparte.
 **Semántica por tramo.** No afirmo exactly-once de punta a punta:
 
 - Productor → Kafka: idempotente (`enable.idempotence=true`, `acks=all`).
-- Kafka → Beam: KafkaIO confirma offsets con `enable.auto.commit`. Flink
-  tiene checkpoints cada 30 s, pero con la lectura SDF de KafkaIO en el
-  runner portable no se completan, así que no cuento con ellos: si el job se
-  reinicia, algunas lecturas se reprocesan. Es **at-least-once**.
+- Kafka → Beam: KafkaIO confirma offsets con `enable.auto.commit`, aparte de
+  los checkpoints de Flink (cada 30 s): si el job se reinicia, algunas
+  lecturas se reprocesan. Es **at-least-once**.
 - Beam → `ema.agregados.v1`: at-least-once, con productor idempotente.
 - Vista final: **idempotente**. El consumidor hace upsert por `aggregate_id`,
   descarta panes con `pane_index` menor al que tiene, y el tópico es
   compactado: reprocesar o republicar no cambia el resultado visible.
 
-En producción haría que los checkpoints se completen (con la lectura clásica
-de KafkaIO se completan) y confirmaría los offsets al terminar cada uno.
+En producción confirmaría los offsets al terminar cada checkpoint, para que
+estado y offsets se restauren juntos.
 
 # 6. Pruebas y evidencia
 
-- **20 pruebas** (`make test`): contrato (ids deterministas, rechazo de
+- **22 pruebas** (`make test`): contrato (ids deterministas, rechazo de
   inválidos), `CombineFn`, pipeline en batch (deduplicación, agregados,
   alertas, DLQ), adaptadores de datos con su control de calidad, productor
-  con atraso real y consumidor (upsert y panes viejos). Cuatro usan
+  (atraso real y replay por lotes) y consumidor (upsert, panes viejos y pane
+  vacío de cierre). Cuatro usan
   `TestStream` y avanzan el watermark a mano: pane LATE acumulado después del
   ON_TIME, dato más tardío que la lateness descartado sin tocar el total,
   duplicado ignorado y `pane_timing` publicado con su nombre.
@@ -148,26 +148,33 @@ pero no la ventana. Un cálculo aparte en pandas, sin Beam, da la misma lluvia
 por estación, los mismos pares de subcuenca y hora y las mismas alertas. Las
 2 entradas a la DLQ son los inválidos que agrega el script.
 
-- **En streaming sobre Flink** (un día de lluvia, 12 estaciones, a 600×):
-  1 618 eventos con 34 duplicados y 1 122 atrasados; las 1 584 ventanas del
-  día aparecen con panes EARLY cada 10 s, todas con una sola lectura; salen
-  las alertas y los agregados por subcuenca, y un evento roto llega a la DLQ
-  con su motivo. Las ventanas no llegan a cerrar durante la demo: el
-  watermark de KafkaIO en el runner portable queda atado al reloj, y el
-  replay acelerado pone el tiempo de evento horas por delante. ON_TIME, LATE
-  y descarte quedan probados con `TestStream`.
+- **En streaming sobre Flink**, un día de lluvia con 12 estaciones (1 584
+  lecturas), en dos modos. Replay acelerado a 600×: 1 618 eventos con 34
+  duplicados y 1 122 atrasados, panes EARLY cada 10 s con una sola lectura
+  por ventana, alertas, agregados por subcuenca y un evento roto en la DLQ
+  con su motivo. Replay por lotes con las fechas originales: las 1 584
+  ventanas cierran ON_TIME en menos de 10 s, con 144 agregados por subcuenca
+  y 7 alertas, todos firmes. Hacen falta los dos porque la política
+  `CreateTime` de KafkaIO fija el watermark en el reloj cuando los eventos
+  están en el futuro, que es lo que produce un replay desplazado a "ahora" y
+  acelerado (lo verifiqué en el código de la jar con `javap`; el laboratorio
+  de la clase 7 tiene el mismo comportamiento). LATE y descarte quedan
+  probados con `TestStream`.
 
 # 7. Límites, supuestos y mejoras
 
 - Lo que llega después de fin de ventana más 20 minutos se pierde y sólo
   queda el contador del runner. Mejora: tópico de auditoría para los
   `too_late` (propuesto en la Tarea 2) y reproceso por lotes de esas ventanas.
-- Sin checkpoints completos la entrada es at-least-once; la corrección
-  visible depende del upsert idempotente.
-- En Flink el watermark no sigue al tiempo de evento del replay acelerado, así
-  que la demo en vivo muestra estimaciones (EARLY) y no el cierre de las
-  ventanas. Mejora: un replay a velocidad real para la demo del cierre, o
-  investigar la política de watermark de KafkaIO en el runner portable.
+- La entrada es at-least-once; la corrección visible depende del upsert
+  idempotente.
+- Con `CreateTime` de KafkaIO un replay acelerado no cierra ventanas en vivo:
+  la demo muestra el cierre con el replay por lotes y las estimaciones con el
+  acelerado. Panes LATE en Flink pedirían un replay a velocidad real (más de
+  media hora) o una política de watermark propia, que el SDK de Python no
+  permite definir para KafkaIO.
+- Al expirar una ventana, Flink emite un pane de cierre vacío: el pipeline
+  lo descarta y el consumidor lo ignora (hallazgo del ensayo).
 - El mapeo de códigos de sensor a variables lo deduje de las unidades de los
   encabezados de los archivos diarios; no es una tabla oficial. Sólo una
   estación informa la hora de envío.
