@@ -18,6 +18,12 @@ x-lab-environment: &lab-environment
   ALERT_GUST_MS: "20"
   HIDROMET_DATASET_SOURCE: "${HIDROMET_DATASET_SOURCE:-openmeteo}"
   HIDROMET_LAB_ROOT: /app
+  # Dataset que reproduce el productor: vacío = data/processed/emas_10min.parquet;
+  # HIDROMET_DATASET=demo = data/processed/demo/emas_10min.parquet (ver README §5).
+  HIDROMET_DATASET_PATH: "/app/data/processed/${HIDROMET_DATASET:-}/emas_10min.parquet"
+  # Valores iniciales de los controles del notebook 1.
+  REPLAY_SPEEDUP: "${REPLAY_SPEEDUP:-60}"
+  REPLAY_BATCH: "${REPLAY_BATCH:-0}"
 
 x-notebook: &notebook
   build:
@@ -73,11 +79,15 @@ services:
       - |
         # KAFKA_RAW_PARTITIONS=1 para datasets con menos estaciones que
         # particiones: una partición sin datos frena el watermark (README §7).
+        # retention.ms=-1: el timestamp de cada mensaje es su event_time, y con
+        # la retención por tiempo (7 días) Kafka borraría en minutos un replay
+        # de datos históricos publicado con sus fechas originales.
         for topic in ema.lecturas.v1 ema.lecturas.dlq.v1; do
           /opt/kafka/bin/kafka-topics.sh \
             --bootstrap-server kafka:9092 \
             --create --if-not-exists \
-            --topic "$$topic" --partitions ${KAFKA_RAW_PARTITIONS:-4} --replication-factor 1
+            --topic "$$topic" --partitions ${KAFKA_RAW_PARTITIONS:-4} --replication-factor 1 \
+            --config retention.ms=-1
         done
         # Los agregados se compactan: por cada aggregate_id queda el último pane.
         /opt/kafka/bin/kafka-topics.sh \

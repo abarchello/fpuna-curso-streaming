@@ -1,37 +1,26 @@
 Prueba de humo end-to-end (Kafka -> Beam sobre Flink -> Kafka) con Docker Compose, perfil smoke.
 Comando: docker compose --profile smoke up --build --abort-on-container-exit --exit-code-from smoke smoke
-Fecha: 2026-09-29T23:04Z  ·  código de salida: 0
+Fecha: 2026-10-01  ·  código de salida: 0  ·  lectura clásica de KafkaIO (BEAM_KAFKA_READ por defecto)
 
-%4|1790698328.866|GETPID|ema-replay-producer#producer-2| [thrd:main]: Failed to acquire idempotence PID from broker kafka:9092/1: Broker: Coordinator load in progress: retrying
+%4|1790831919.914|GETPID|ema-replay-producer#producer-2| [thrd:main]: Failed to acquire idempotence PID from broker kafka:9092/1: Broker: Coordinator load in progress: retrying
 {"state": "DONE"}
 {
   "produced": {
     "events": 127,
     "duplicates": 7,
-    "delayed": 83
+    "delayed": 85
   },
   "consumed": {
-    "messages_seen": 260,
-    "logical_aggregates": 130,
-    "revisions": 130,
+    "messages_seen": 136,
+    "logical_aggregates": 136,
+    "revisions": 0,
     "station_windows": 120,
-    "basin_windows": 10,
+    "basin_windows": 16,
     "alerts": 0
   }
 }
-{"state": "DONE"}
-{
-  "produced": {
-    "events": 127,
-    "duplicates": 7,
-    "delayed": 83
-  },
-  "consumed": {
-    "messages_seen": 258,
-    "logical_aggregates": 129,
-    "revisions": 129,
-    "station_windows": 120,
-    "basin_windows": 9,
-    "alerts": 0
-  }
-}
+
+Los 7 duplicados no suman: 120 ventanas de estación para 120 lecturas. `revisions = 0` porque el
+pipeline ya no publica el pane vacío de cierre (en la corrida del 29-09 eran 130 revisiones, una
+por ventana). El aviso GETPID es del primer envío contra un broker recién levantado y se reintenta
+solo.

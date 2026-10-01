@@ -40,13 +40,20 @@ def _(mo):
 
 
 @app.cell
-def _(mo, processed_dataset_path):
+def _(mo, processed_dataset_path, project_root):
     # Cada dataset preparado vive en data/processed/ o en una subcarpeta (--output).
-    processed_dir = processed_dataset_path().parent
-    candidates = sorted(processed_dir.rglob("*.parquet")) or [processed_dataset_path()]
+    # El que queda elegido al abrir es el de HIDROMET_DATASET_PATH (compose: HIDROMET_DATASET),
+    # así una recarga de la página no cambia el dataset de la demo.
+    processed_dir = project_root() / "data/processed"
+    default_path = processed_dataset_path().resolve()
+    candidates = sorted(processed_dir.rglob("*.parquet")) or [default_path]
     candidates = [p for p in candidates if not p.name.startswith("agregados")] or candidates
-    dataset_options = {str(p.relative_to(processed_dir)): str(p) for p in candidates}
-    default_choice = processed_dataset_path().name
+    dataset_options = {p.relative_to(processed_dir).as_posix(): str(p) for p in candidates}
+    default_choice = (
+        default_path.relative_to(processed_dir).as_posix()
+        if default_path.is_relative_to(processed_dir)
+        else default_path.name
+    )
     dataset_choice = mo.ui.dropdown(
         options=dataset_options,
         value=default_choice if default_choice in dataset_options else next(iter(dataset_options)),
@@ -122,15 +129,23 @@ def _(alt, manifest, mo, readings, real_arrivals):
 
 @app.cell
 def _(mo):
-    speedup = mo.ui.slider(10, 600, value=60, step=10, label="Aceleración")
-    max_readings = mo.ui.number(100, 50_000, value=3_000, step=100, label="Máximo de lecturas")
+    import os
+
+    # Valores iniciales configurables (compose: REPLAY_SPEEDUP y REPLAY_BATCH): una sesión
+    # nueva del notebook arranca ya con los de la demo.
+    default_speedup = min(600, max(10, int(float(os.getenv("REPLAY_SPEEDUP", "60")))))
+    default_batch = os.getenv("REPLAY_BATCH", "0").lower() in ("1", "true", "si", "sí")
+    speedup = mo.ui.slider(
+        10, 600, value=default_speedup, step=10, label="Aceleración", show_value=True
+    )
+    max_readings = mo.ui.number(100, 50_000, value=3_000, step=1, label="Máximo de lecturas")
     duplicate_rate = mo.ui.slider(
         0.0, 0.10, value=0.02, step=0.01, label="Probabilidad de duplicado"
     )
     jitter = mo.ui.slider(0.0, 3.0, value=0.0, step=0.25, label="Jitter de llegada (s)")
     link_delays = mo.ui.checkbox(value=True, label="Atrasos de llegada (reales o por enlace)")
     batch_replay = mo.ui.checkbox(
-        value=False, label="Cierre de ventanas: fechas originales, publicar de una vez"
+        value=default_batch, label="Cierre de ventanas: fechas originales, en orden y de una vez"
     )
     start_producer = mo.ui.run_button(label="▶ Iniciar replay")
     stop_producer = mo.ui.run_button(label="■ Detener replay")
@@ -153,9 +168,12 @@ def _(mo):
                 Con el replay desplazado a "ahora" los eventos quedan en el
                 futuro y el watermark de KafkaIO se limita al reloj: se ven las
                 estimaciones (panes EARLY) pero las ventanas no cierran durante
-                la demo. **Cierre de ventanas** publica el período de una vez con
-                sus fechas originales: el watermark sigue al tiempo de evento y
-                en segundos aparecen los panes ON_TIME con los totales firmes.
+                la demo. **Cierre de ventanas** publica el período de una vez,
+                en orden de medición y con sus fechas originales: el watermark
+                sigue al tiempo de evento y las ventanas cierran con sus panes
+                ON_TIME y los totales firmes. Para ese modo conviene publicar
+                primero y enviar el job después (notebook 2): el pipeline lee el
+                log desde el principio, como en un reprocesamiento.
                 """
             ),
             mo.hstack([speedup, max_readings, duplicate_rate, jitter], widths="equal"),
@@ -220,7 +238,10 @@ def _(
         if not link_delays.value:
             command.append("--no-link-delays")
         if batch_replay.value:
+            # En orden de medición: así ninguna lectura puede quedar detrás del watermark.
             command.extend(["--keep-event-time", "--no-realtime"])
+            if link_delays.value:
+                command.append("--no-link-delays")
         producer_process.start(command, log_path=project_root() / "tmp/producer.log")
     return
 

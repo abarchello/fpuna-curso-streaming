@@ -1,16 +1,16 @@
-Ensayos en streaming con la pila de Docker (Kafka -> Beam sobre Flink -> Kafka), 2026-09-30.
+Ensayos en streaming con la pila de Docker (Kafka -> Beam sobre Flink -> Kafka), 2026-09-30 y 2026-10-01.
 Dataset: un día de la serie de lluvia (2026-02-03), 12 estaciones, 1 584 lecturas (no se publica).
 Job enviado desde el notebook 2; replay desde el notebook 1 / `python -m hidromet_streaming.producer`.
-Conteos leídos de los tópicos con un consumidor aparte.
+Conteos leídos de los tópicos con `python -m hidromet_streaming.topics`.
 
 1. Replay acelerado (600x, primera lectura desplazada a "ahora"), lectura clásica de KafkaIO
 
   publicado: {"events": 1618, "duplicates": 34, "delayed": 1122}
-  ema.agregados.v1: 1 584 ventanas de estación con panes EARLY (2 628 mensajes), ninguna con
-    más de una lectura; agregados de subcuenca y alertas de lluvia intensa, todos EARLY
+  ema.agregados.v1: 1 584 ventanas de estación con panes EARLY, ninguna con más de una
+    lectura; agregados de subcuenca y 7 alertas de lluvia intensa, todos EARLY
   ema.lecturas.dlq.v1: 1 mensaje (evento sin campos obligatorios mandado con kafka-console-producer)
-  desorden en el tópico de entrada: por partición, entre 41 y 125 mensajes llegaron con un
-    timestamp anterior al del mensaje previo; 34 event_id repetidos
+  desorden en el tópico de entrada, por partición (mensajes / con timestamp anterior al previo):
+    0: 291 / 118 · 1: 443 / 46 · 2: 442 / 41 · 3: 442 / 124; 34 event_id repetidos
   resultado: ningún pane ON_TIME ni LATE mientras corrió la demo
 
   Causa (leída con javap en CustomTimestampPolicyWithLimitedDelay, dentro de
@@ -21,17 +21,28 @@ Conteos leídos de los tópicos con un consumidor aparte.
   Con el replay desplazado a "ahora" y acelerado, a los pocos segundos todos los eventos están
   horas en el futuro: el watermark queda en la hora actual y las ventanas, adelante, no cierran.
 
-2. Cierre de ventanas: fechas originales, publicación de una vez (--keep-event-time --no-realtime)
+2. Cierre de ventanas: fechas originales, en orden y de una vez
+   (--keep-event-time --no-realtime --no-link-delays), publicando primero y enviando el job después
 
-  publicado: {"events": 1618, "duplicates": 34, "delayed": 1122}
-  a los 10 s: 1 584 ventanas de estación con pane ON_TIME, cada una con n_lecturas = 1
+  publicado: {"events": 1621, "duplicates": 37, "delayed": 0}
+  al terminar de leer el log (unos 75 s desde que el job queda RUNNING):
+              1 584 ventanas de estación con pane ON_TIME, cada una con n_lecturas = 1
               144 agregados de subcuenca por hora (6 subcuencas x 24 h), ON_TIME
               7 alertas de lluvia intensa, ON_TIME
-  pane LATE: ninguno (el lector consume el lote antes de la primera emisión del watermark)
+              0 panes vacíos; el tópico de entrada conserva sus 1 621 mensajes
+  Repetido 6 veces desde cero (una con el job enviado 56 minutos después de publicar): el estado
+  final fue siempre el mismo. En 2 de las 6 aparecieron además 22 panes LATE con el mismo
+  contenido que el ON_TIME de su ventana; el upsert por aggregate_id los absorbe.
 
-  Hallazgo: al expirar cada ventana el runner emitía un segundo pane ON_TIME vacío
-  (n_lecturas = 0, mismo pane_index) y el consumidor lo tomaba como revisión. Corregido:
-  el pipeline descarta los panes vacíos y el consumidor los ignora si ya tiene datos.
+  Hallazgos de estos ensayos, corregidos en el código:
+  - Retención: el tópico de entrada tenía la retención por tiempo por defecto (7 días) y el
+    timestamp de cada mensaje es su event_time. Un replay con fechas de meses atrás quedaba
+    vencido y el broker lo borraba en su siguiente limpieza (a los 30 s de arrancar y cada 5 min):
+    según el momento, el pipeline leía todo (1 584 ventanas), una parte (1 579) o nada. Ahora el
+    tópico de entrada y la DLQ se crean con retention.ms=-1.
+  - Pane vacío: al expirar cada ventana el runner emitía un segundo pane ON_TIME vacío
+    (n_lecturas = 0, mismo pane_index) y el consumidor lo tomaba como revisión. El pipeline
+    descarta los panes vacíos y el consumidor los ignora si ya tiene datos.
 
 3. Lectura SDF de KafkaIO (use_sdf_read, la del laboratorio de la clase 7)
 

@@ -28,7 +28,8 @@ class ManagedProcess:
         if self.running:
             raise RuntimeError("process is already running")
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_handle = log_path.open("a", buffering=1)
+        # Cada arranque empieza con el log vacío: el notebook muestra sólo la corrida actual.
+        log_handle = log_path.open("w", buffering=1)
         self.process = subprocess.Popen(
             command,
             stdout=log_handle,
